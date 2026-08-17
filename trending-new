@@ -1,4 +1,4 @@
-#!/Users/nicolas/scripts/trending-new/.venv/bin/python
+#!/usr/bin/env python3
 """Show GitHub Trending entries that have not been displayed before."""
 
 from __future__ import annotations
@@ -11,10 +11,11 @@ import sqlite3
 import subprocess
 import sys
 import webbrowser
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterable
+from typing import Callable, Iterable, Iterator
 from urllib.parse import quote
 
 import requests
@@ -43,46 +44,70 @@ class Entry:
 
 
 def state_path() -> Path:
-    data_home = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share"))
+    configured_home = os.environ.get("XDG_DATA_HOME")
+    data_home = Path(configured_home) if configured_home else None
+    if data_home is None or not data_home.is_absolute():
+        data_home = Path.home() / ".local" / "share"
     return data_home / "trending-new" / "state.sqlite3"
+
+
+@contextmanager
+def immediate_transaction(database: sqlite3.Connection) -> Iterator[None]:
+    database.execute("BEGIN IMMEDIATE")
+    try:
+        yield
+    except BaseException:
+        database.rollback()
+        raise
+    else:
+        database.commit()
 
 
 def connect_database() -> sqlite3.Connection:
     path = state_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     database = sqlite3.connect(path)
-    database.execute("""
-        CREATE TABLE IF NOT EXISTS seen (
-            kind TEXT NOT NULL,
-            identifier TEXT NOT NULL,
-            first_seen_at TEXT NOT NULL,
-            last_seen_at TEXT NOT NULL,
-            url TEXT NOT NULL,
-            description TEXT NOT NULL,
-            language TEXT,
-            stars INTEGER,
-            gained_stars INTEGER,
-            trending_range TEXT,
-            PRIMARY KEY (kind, identifier)
-        )
-    """)
+    try:
+        with immediate_transaction(database):
+            database.execute("""
+                CREATE TABLE IF NOT EXISTS seen (
+                    kind TEXT NOT NULL,
+                    identifier TEXT NOT NULL,
+                    first_seen_at TEXT NOT NULL,
+                    last_seen_at TEXT NOT NULL,
+                    url TEXT NOT NULL,
+                    description TEXT NOT NULL,
+                    language TEXT,
+                    stars INTEGER,
+                    gained_stars INTEGER,
+                    trending_range TEXT,
+                    PRIMARY KEY (kind, identifier)
+                )
+            """)
 
-    existing_columns = {row[1] for row in database.execute("PRAGMA table_info(seen)")}
-    for column, column_type in (
-        ("language", "TEXT"),
-        ("stars", "INTEGER"),
-        ("gained_stars", "INTEGER"),
-        ("trending_range", "TEXT"),
-    ):
-        if column not in existing_columns:
-            database.execute(f"ALTER TABLE seen ADD COLUMN {column} {column_type}")
-    database.commit()
+            existing_columns = {
+                row[1] for row in database.execute("PRAGMA table_info(seen)")
+            }
+            for column, column_type in (
+                ("language", "TEXT"),
+                ("stars", "INTEGER"),
+                ("gained_stars", "INTEGER"),
+                ("trending_range", "TEXT"),
+            ):
+                if column not in existing_columns:
+                    database.execute(f"ALTER TABLE seen ADD COLUMN {column} {column_type}")
+    except BaseException:
+        database.close()
+        raise
     return database
 
 
 def make_console() -> Console:
+    plain_output = not sys.stdout.isatty() or "NO_COLOR" in os.environ
     return Console(
-        no_color=not sys.stdout.isatty() or "NO_COLOR" in os.environ,
+        no_color=plain_output,
+        color_system=None if plain_output else "auto",
+        force_terminal=False if plain_output else None,
         highlight=False,
     )
 
@@ -141,6 +166,9 @@ def fetch_repositories(time_range: str, language: str | None) -> list[Entry]:
         )
 
     if not entries:
+        page_text = clean_text(document).casefold()
+        if "have any trending repositories for your choices" in page_text:
+            return []
         raise SystemExit("GitHub returned no repositories; its page structure may have changed.")
     return entries
 
@@ -166,12 +194,18 @@ def fetch_developers(time_range: str) -> list[Entry]:
 
 
 def unseen_entries(database: sqlite3.Connection, kind: str, entries: Iterable[Entry]) -> list[Entry]:
-    return [
-        entry for entry in entries
+    unseen: list[Entry] = []
+    checked_identifiers: set[str] = set()
+    for entry in entries:
+        if entry.identifier in checked_identifiers:
+            continue
+        checked_identifiers.add(entry.identifier)
         if not database.execute(
-            "SELECT 1 FROM seen WHERE kind = ? AND identifier = ?", (kind, entry.identifier)
-        ).fetchone()
-    ]
+            "SELECT 1 FROM seen WHERE kind = ? AND identifier = ?",
+            (kind, entry.identifier),
+        ).fetchone():
+            unseen.append(entry)
+    return unseen
 
 
 def record_seen(database: sqlite3.Connection, kind: str, entries: Iterable[Entry]) -> None:
@@ -207,7 +241,20 @@ def record_seen(database: sqlite3.Connection, kind: str, entries: Iterable[Entry
             for entry in entries
         ],
     )
-    database.commit()
+
+
+def process_unseen_entries(
+    database: sqlite3.Connection,
+    kind: str,
+    entries: Iterable[Entry],
+    display: Callable[[list[Entry]], None],
+) -> list[Entry]:
+    with immediate_transaction(database):
+        new_entries = unseen_entries(database, kind, entries)
+        if new_entries:
+            display(new_entries)
+            record_seen(database, kind, new_entries)
+    return new_entries
 
 
 def format_count(value: int | None) -> str:
@@ -469,22 +516,25 @@ def main() -> None:
                     if arguments.developers
                     else fetch_repositories(time_range, arguments.language)
                 )
-                new_entries = unseen_entries(database, kind, fetched_entries)
+                def display(new_entries: list[Entry]) -> None:
+                    if entries:
+                        console.print()
+                    print_entries(
+                        new_entries,
+                        console,
+                        kind=kind,
+                        time_range=time_range,
+                        language=arguments.language,
+                        history=False,
+                        show_range=arguments.command == "all",
+                        start_index=len(entries) + 1,
+                    )
+
+                new_entries = process_unseen_entries(
+                    database, kind, fetched_entries, display
+                )
                 if not new_entries:
                     continue
-                if entries:
-                    console.print()
-                print_entries(
-                    new_entries,
-                    console,
-                    kind=kind,
-                    time_range=time_range,
-                    language=arguments.language,
-                    history=False,
-                    show_range=arguments.command == "all",
-                    start_index=len(entries) + 1,
-                )
-                record_seen(database, kind, new_entries)
                 entries.extend(new_entries)
 
             if not entries:

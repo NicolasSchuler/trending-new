@@ -26,12 +26,14 @@ Repository and developer names are clickable terminal hyperlinks. Cmd-click a na
 
 Interactive repository tables use ⭐ for total stars and 🔥 for the current trend. Combined and history views include `/ day`, `/ wk`, or `/ mo` beside the gain. The table automatically falls back to plain text without emoji, colour, or links when piped or when `NO_COLOR` is set. Narrow terminals retain the trend metrics and move descriptions beneath the repository name.
 
-Dependencies live in `.venv`, created with `uv`. To recreate it:
+Dependencies live in `.venv`, created with `uv`. To recreate and activate it:
 
 ```bash
-cd /Users/nicolas/scripts/trending-new
+cd /path/to/trending-new
 uv venv .venv
 uv pip install -r requirements.txt
+source .venv/bin/activate
+./trending-new --help
 ```
 
 Run the local checks with:

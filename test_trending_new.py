@@ -1,10 +1,14 @@
 import importlib.machinery
 import importlib.util
 import os
+import shutil
 import sqlite3
+import subprocess
 import sys
 import tempfile
+import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import redirect_stdout
 from io import StringIO
 from pathlib import Path
@@ -183,6 +187,202 @@ class TrendingNewTests(unittest.TestCase):
         self.assertIn("TREND WHEN FOUND", plain_output)
         self.assertNotIn("⭐", plain_output)
         self.assertNotIn("🔥", plain_output)
+
+
+    def test_state_path_uses_only_absolute_xdg_data_home(self):
+        with tempfile.TemporaryDirectory() as root:
+            root_path = Path(root)
+            home = root_path / "home"
+            absolute_data_home = root_path / "data"
+            default_data_home = home / ".local" / "share"
+            cases = (
+                (None, default_data_home),
+                ("", default_data_home),
+                ("relative/data", default_data_home),
+                (str(absolute_data_home), absolute_data_home),
+            )
+
+            for configured_home, expected_data_home in cases:
+                environment = (
+                    {}
+                    if configured_home is None
+                    else {"XDG_DATA_HOME": configured_home}
+                )
+                with self.subTest(configured_home=configured_home), patch.dict(
+                    os.environ, environment, clear=True
+                ), patch.object(module.Path, "home", return_value=home):
+                    self.assertEqual(
+                        module.state_path(),
+                        expected_data_home / "trending-new" / "state.sqlite3",
+                    )
+
+    def test_concurrent_legacy_migrations_are_serialized(self):
+        with tempfile.TemporaryDirectory() as data_home, patch.dict(
+            os.environ, {"XDG_DATA_HOME": data_home}
+        ):
+            database_file = Path(data_home) / "trending-new" / "state.sqlite3"
+            database_file.parent.mkdir()
+            legacy = sqlite3.connect(database_file)
+            legacy.execute("""
+                CREATE TABLE seen (
+                    kind TEXT NOT NULL,
+                    identifier TEXT NOT NULL,
+                    first_seen_at TEXT NOT NULL,
+                    last_seen_at TEXT NOT NULL,
+                    url TEXT NOT NULL,
+                    description TEXT NOT NULL,
+                    PRIMARY KEY (kind, identifier)
+                )
+            """)
+            legacy.commit()
+            legacy.close()
+
+            start = threading.Barrier(2)
+
+            def migrate():
+                start.wait(timeout=5)
+                database = module.connect_database()
+                try:
+                    return {
+                        row[1]
+                        for row in database.execute("PRAGMA table_info(seen)")
+                    }
+                finally:
+                    database.close()
+
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                futures = [executor.submit(migrate) for _ in range(2)]
+                migrated_columns = [future.result(timeout=10) for future in futures]
+
+        expected_columns = {"language", "stars", "gained_stars", "trending_range"}
+        for columns in migrated_columns:
+            self.assertTrue(expected_columns <= columns)
+
+    def test_concurrent_processing_displays_an_entry_once(self):
+        with tempfile.TemporaryDirectory() as data_home, patch.dict(
+            os.environ, {"XDG_DATA_HOME": data_home}
+        ):
+            database = module.connect_database()
+            database.close()
+            start = threading.Barrier(2)
+            display_lock = threading.Lock()
+            displayed = []
+
+            def process():
+                connection = module.connect_database()
+                start.wait(timeout=5)
+
+                def display(entries):
+                    with display_lock:
+                        displayed.extend(entry.identifier for entry in entries)
+
+                try:
+                    return len(
+                        module.process_unseen_entries(
+                            connection, "repository", [self.entry], display
+                        )
+                    )
+                finally:
+                    connection.close()
+
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                futures = [executor.submit(process) for _ in range(2)]
+                result_lengths = sorted(future.result(timeout=10) for future in futures)
+
+        self.assertEqual(result_lengths, [0, 1])
+        self.assertEqual(displayed, [self.entry.identifier])
+
+    def test_duplicate_entries_in_one_batch_are_displayed_once(self):
+        with tempfile.TemporaryDirectory() as data_home, patch.dict(
+            os.environ, {"XDG_DATA_HOME": data_home}
+        ):
+            database = module.connect_database()
+            displayed = []
+            try:
+                new_entries = module.process_unseen_entries(
+                    database,
+                    "repository",
+                    [self.entry, self.entry],
+                    displayed.extend,
+                )
+                row_count = database.execute("SELECT COUNT(*) FROM seen").fetchone()[0]
+            finally:
+                database.close()
+
+        self.assertEqual(new_entries, [self.entry])
+        self.assertEqual(displayed, [self.entry])
+        self.assertEqual(row_count, 1)
+
+    def test_launcher_runs_from_a_relocated_checkout(self):
+        self.assertEqual(
+            SCRIPT.read_text(encoding="utf-8").splitlines()[0],
+            "#!/usr/bin/env python3",
+        )
+        with tempfile.TemporaryDirectory() as root:
+            checkout = Path(root) / "relocated"
+            checkout.mkdir()
+            relocated_script = checkout / "trending-new"
+            shutil.copy2(SCRIPT, relocated_script)
+            environment = os.environ.copy()
+            environment["PATH"] = (
+                str(Path(sys.executable).parent)
+                + os.pathsep
+                + environment.get("PATH", "")
+            )
+            environment["PYTHONDONTWRITEBYTECODE"] = "1"
+            result = subprocess.run(
+                [str(relocated_script), "--help"],
+                cwd=checkout,
+                env=environment,
+                text=True,
+                capture_output=True,
+                timeout=10,
+                check=False,
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Show GitHub Trending", result.stdout)
+
+    def test_no_color_tty_output_has_no_terminal_sequences(self):
+        class TtyStringIO(StringIO):
+            def isatty(self):
+                return True
+
+        output = TtyStringIO()
+        with patch.object(sys, "stdout", output), patch.dict(
+            os.environ, {"NO_COLOR": "1"}
+        ):
+            console = module.make_console()
+            console.print(module.repository_table([self.entry], console, show_range=True))
+            console.print(module.developer_table([self.entry]))
+
+        rendered = output.getvalue()
+        self.assertFalse(console.is_terminal)
+        self.assertIn(self.entry.identifier, rendered)
+        self.assertNotIn("\x1b", rendered)
+        self.assertNotIn(self.entry.url, rendered)
+        self.assertNotIn("⭐", rendered)
+        self.assertNotIn("🔥", rendered)
+
+    def test_repository_blank_state_is_not_a_parser_error(self):
+        blank_state = module.BeautifulSoup(
+            """
+            <main>
+              <h2>It looks like we don’t have any trending repositories for your choices.</h2>
+            </main>
+            """,
+            "html.parser",
+        )
+        with patch.object(module, "fetch_page", return_value=blank_state):
+            self.assertEqual(module.fetch_repositories("daily", "unknown"), [])
+
+    def test_unrecognized_empty_repository_page_is_a_parser_error(self):
+        malformed_page = module.BeautifulSoup(
+            "<main><h2>Unexpected response</h2></main>", "html.parser"
+        )
+        with patch.object(module, "fetch_page", return_value=malformed_page):
+            with self.assertRaisesRegex(SystemExit, "page structure may have changed"):
+                module.fetch_repositories("daily", None)
 
 
 if __name__ == "__main__":
