@@ -1,0 +1,503 @@
+#!/Users/nicolas/scripts/trending-new/.venv/bin/python
+"""Show GitHub Trending entries that have not been displayed before."""
+
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import shutil
+import sqlite3
+import subprocess
+import sys
+import webbrowser
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Iterable
+from urllib.parse import quote
+
+import requests
+from bs4 import BeautifulSoup
+from rich import box
+from rich.console import Console
+from rich.table import Table
+from rich.text import Text
+
+RANGES = ("daily", "weekly", "monthly")
+DEFAULT_TIMEOUT_SECONDS = 20
+USER_AGENT = "trending-new/1.1 (+https://github.com)"
+RANGE_LABELS = {"daily": "day", "weekly": "week", "monthly": "month"}
+RANGE_SHORT_LABELS = {"daily": "day", "weekly": "wk", "monthly": "mo"}
+
+
+@dataclass(frozen=True)
+class Entry:
+    identifier: str
+    url: str
+    description: str
+    language: str | None = None
+    stars: int | None = None
+    gained_stars: int | None = None
+    trending_range: str | None = None
+
+
+def state_path() -> Path:
+    data_home = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share"))
+    return data_home / "trending-new" / "state.sqlite3"
+
+
+def connect_database() -> sqlite3.Connection:
+    path = state_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    database = sqlite3.connect(path)
+    database.execute("""
+        CREATE TABLE IF NOT EXISTS seen (
+            kind TEXT NOT NULL,
+            identifier TEXT NOT NULL,
+            first_seen_at TEXT NOT NULL,
+            last_seen_at TEXT NOT NULL,
+            url TEXT NOT NULL,
+            description TEXT NOT NULL,
+            language TEXT,
+            stars INTEGER,
+            gained_stars INTEGER,
+            trending_range TEXT,
+            PRIMARY KEY (kind, identifier)
+        )
+    """)
+
+    existing_columns = {row[1] for row in database.execute("PRAGMA table_info(seen)")}
+    for column, column_type in (
+        ("language", "TEXT"),
+        ("stars", "INTEGER"),
+        ("gained_stars", "INTEGER"),
+        ("trending_range", "TEXT"),
+    ):
+        if column not in existing_columns:
+            database.execute(f"ALTER TABLE seen ADD COLUMN {column} {column_type}")
+    database.commit()
+    return database
+
+
+def make_console() -> Console:
+    return Console(
+        no_color=not sys.stdout.isatty() or "NO_COLOR" in os.environ,
+        highlight=False,
+    )
+
+
+def fetch_page(url: str, params: dict[str, str]) -> BeautifulSoup:
+    try:
+        response = requests.get(
+            url,
+            params=params,
+            headers={"User-Agent": USER_AGENT},
+            timeout=DEFAULT_TIMEOUT_SECONDS,
+        )
+        response.raise_for_status()
+    except requests.RequestException as error:
+        raise SystemExit(f"Could not fetch GitHub Trending: {error}") from error
+    return BeautifulSoup(response.text, "html.parser")
+
+
+def clean_text(node: object | None) -> str:
+    return node.get_text(" ", strip=True) if node else ""
+
+
+def parse_count(text: str) -> int | None:
+    match = re.search(r"\d[\d,]*", text)
+    return int(match.group().replace(",", "")) if match else None
+
+
+def fetch_repositories(time_range: str, language: str | None) -> list[Entry]:
+    url = "https://github.com/trending"
+    if language:
+        url += "/" + quote(language, safe="")
+    document = fetch_page(url, {"since": time_range})
+
+    entries: list[Entry] = []
+    for row in document.select("article.Box-row"):
+        link = row.select_one("h2 a[href]")
+        if not link:
+            continue
+        identifier = link["href"].strip("/")
+        if identifier.count("/") != 1:
+            continue
+
+        language_node = row.select_one('[itemprop="programmingLanguage"]')
+        star_node = row.select_one('a[href$="/stargazers"]')
+        gain_node = row.select_one("span.float-sm-right")
+        entries.append(
+            Entry(
+                identifier=identifier,
+                url=f"https://github.com/{identifier}",
+                description=clean_text(row.select_one("p")),
+                language=clean_text(language_node) or None,
+                stars=parse_count(clean_text(star_node)),
+                gained_stars=parse_count(clean_text(gain_node)),
+                trending_range=time_range,
+            )
+        )
+
+    if not entries:
+        raise SystemExit("GitHub returned no repositories; its page structure may have changed.")
+    return entries
+
+
+def fetch_developers(time_range: str) -> list[Entry]:
+    document = fetch_page("https://github.com/trending/developers", {"since": time_range})
+
+    entries: list[Entry] = []
+    for row in document.select("article.Box-row"):
+        link = row.select_one("h1.h3 a[href]")
+        if not link:
+            continue
+        identifier = link["href"].strip("/")
+        if not identifier or "/" in identifier:
+            continue
+        entries.append(
+            Entry(identifier, f"https://github.com/{identifier}", clean_text(row.select_one("p")))
+        )
+
+    if not entries:
+        raise SystemExit("GitHub returned no developers; its page structure may have changed.")
+    return entries
+
+
+def unseen_entries(database: sqlite3.Connection, kind: str, entries: Iterable[Entry]) -> list[Entry]:
+    return [
+        entry for entry in entries
+        if not database.execute(
+            "SELECT 1 FROM seen WHERE kind = ? AND identifier = ?", (kind, entry.identifier)
+        ).fetchone()
+    ]
+
+
+def record_seen(database: sqlite3.Connection, kind: str, entries: Iterable[Entry]) -> None:
+    timestamp = datetime.now(timezone.utc).isoformat()
+    database.executemany(
+        """
+        INSERT INTO seen(
+            kind, identifier, first_seen_at, last_seen_at, url, description,
+            language, stars, gained_stars, trending_range
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(kind, identifier) DO UPDATE SET
+            last_seen_at = excluded.last_seen_at,
+            url = excluded.url,
+            description = excluded.description,
+            language = excluded.language,
+            stars = excluded.stars,
+            gained_stars = excluded.gained_stars,
+            trending_range = excluded.trending_range
+        """,
+        [
+            (
+                kind,
+                entry.identifier,
+                timestamp,
+                timestamp,
+                entry.url,
+                entry.description,
+                entry.language,
+                entry.stars,
+                entry.gained_stars,
+                entry.trending_range,
+            )
+            for entry in entries
+        ],
+    )
+    database.commit()
+
+
+def format_count(value: int | None) -> str:
+    if value is None:
+        return "—"
+    if value < 1_000:
+        return f"{value:,}"
+    for divisor, suffix in ((1_000_000_000, "b"), (1_000_000, "m"), (1_000, "k")):
+        if value >= divisor:
+            compact = f"{value / divisor:.1f}".rstrip("0").rstrip(".")
+            return f"{compact}{suffix}"
+    return str(value)
+
+
+def trend_label(entry: Entry, *, show_range: bool) -> str:
+    if entry.gained_stars is None:
+        return "—"
+    suffix = RANGE_SHORT_LABELS.get(entry.trending_range or "", "")
+    return f"+{format_count(entry.gained_stars)}" + (f" / {suffix}" if show_range and suffix else "")
+
+
+def repository_cell(entry: Entry, include_description: bool) -> Text:
+    cell = Text()
+    cell.append(entry.identifier, style=f"bold cyan link {entry.url}")
+    if include_description and entry.description:
+        cell.append("\n")
+        cell.append(entry.description, style="dim")
+    return cell
+
+
+def new_table() -> Table:
+    return Table(
+        box=box.SIMPLE_HEAVY,
+        border_style="dim",
+        header_style="bold cyan",
+        pad_edge=False,
+        collapse_padding=True,
+        show_lines=False,
+    )
+
+
+def repository_table(
+    entries: list[Entry], console: Console, *, show_range: bool, start_index: int = 1
+) -> Table:
+    width = console.width
+    table = new_table()
+    use_emoji = console.is_terminal and not console.no_color
+    stars_header = "⭐ STARS" if use_emoji else "STARS"
+    trend_header = (
+        "TREND WHEN FOUND" if show_range and width >= 110 else ("TREND" if show_range else "GAIN")
+    )
+    if use_emoji:
+        trend_header = f"🔥 {trend_header}"
+
+    if width >= 110:
+        table.add_column("#", justify="right", width=3)
+        table.add_column("REPOSITORY", min_width=22, max_width=34, no_wrap=True, overflow="ellipsis")
+        table.add_column("LANGUAGE", min_width=9, max_width=13, no_wrap=True, overflow="ellipsis")
+        table.add_column(stars_header, justify="right", width=8)
+        table.add_column(trend_header, justify="right", min_width=9, max_width=19)
+        table.add_column("DESCRIPTION", ratio=1, overflow="fold")
+        for index, entry in enumerate(entries, start=start_index):
+            table.add_row(
+                str(index),
+                repository_cell(entry, False),
+                entry.language or "—",
+                format_count(entry.stars),
+                Text(trend_label(entry, show_range=show_range), style="bold green"),
+                Text(entry.description or "—", style="dim"),
+            )
+        return table
+
+    if width >= 80:
+        table.add_column("#", justify="right", width=3)
+        table.add_column("REPOSITORY", ratio=1, min_width=26)
+        table.add_column("LANGUAGE", min_width=8, max_width=12, no_wrap=True, overflow="ellipsis")
+        table.add_column(stars_header, justify="right", width=8 if use_emoji else 7)
+        table.add_column(trend_header, justify="right", min_width=8, max_width=15)
+        for index, entry in enumerate(entries, start=start_index):
+            table.add_row(
+                str(index),
+                repository_cell(entry, True),
+                entry.language or "—",
+                format_count(entry.stars),
+                Text(trend_label(entry, show_range=show_range), style="bold green"),
+            )
+        return table
+
+    table.add_column("#", justify="right", width=3)
+    table.add_column("REPOSITORY", ratio=1, min_width=20)
+    table.add_column("SIGNAL", justify="right", min_width=13, max_width=22)
+    for index, entry in enumerate(entries, start=start_index):
+        signal = f"{entry.language or '—'} · {format_count(entry.stars)} · {trend_label(entry, show_range=show_range)}"
+        table.add_row(str(index), repository_cell(entry, True), Text(signal, style="green"))
+    return table
+
+
+def developer_table(entries: list[Entry], *, start_index: int = 1) -> Table:
+    table = new_table()
+    table.add_column("#", justify="right", width=3)
+    table.add_column("DEVELOPER", min_width=20)
+    table.add_column("PROFILE NAME", ratio=1)
+    for index, entry in enumerate(entries, start=start_index):
+        table.add_row(
+            str(index),
+            Text(entry.identifier, style=f"bold cyan link {entry.url}"),
+            entry.description or "—",
+        )
+    return table
+
+
+def print_entries(
+    entries: list[Entry],
+    console: Console,
+    *,
+    kind: str,
+    time_range: str | None,
+    language: str | None,
+    history: bool,
+    show_range: bool,
+    start_index: int = 1,
+) -> None:
+    if history:
+        title = f"Previously shown GitHub Trending {'developers' if kind == 'developer' else 'repositories'}"
+        subtitle = f"{len(entries)} recorded locally · select with --open to revisit"
+    elif kind == "repository":
+        source_language = language or "all languages"
+        title = f"GitHub Trending · {time_range.title()} · {source_language}"
+        subtitle = f"{len(entries)} new repositories · total stars and gain this {RANGE_LABELS[time_range]}"
+    else:
+        title = f"GitHub Trending Developers · {time_range.title()}"
+        subtitle = f"{len(entries)} new developers"
+
+    console.print(Text(title, style="bold"))
+    console.print(Text(subtitle, style="dim"))
+    console.print(
+        repository_table(entries, console, show_range=show_range, start_index=start_index)
+        if kind == "repository"
+        else developer_table(entries, start_index=start_index)
+    )
+
+
+def picker_label(entry: Entry, index: int, *, show_range: bool) -> str:
+    if entry.language or entry.stars is not None or entry.gained_stars is not None:
+        return (
+            f"{index:>2}  {entry.identifier:<34.34}  {(entry.language or '—'):<12.12} "
+            f"{format_count(entry.stars):>8}  {trend_label(entry, show_range=show_range):>12}  {entry.description}"
+        )
+    return f"{index:>2}  {entry.identifier:<34.34}  {entry.description}"
+
+
+def select_entries(entries: list[Entry], *, show_range: bool) -> list[Entry]:
+    if not sys.stdin.isatty():
+        raise SystemExit("--open needs an interactive terminal.")
+
+    if shutil.which("fzf"):
+        choices = [
+            f"{entry.identifier}\t{picker_label(entry, index, show_range=show_range)}"
+            for index, entry in enumerate(entries, start=1)
+        ]
+        result = subprocess.run(
+            [
+                "fzf",
+                "--multi",
+                "--delimiter=\\t",
+                "--with-nth=2..",
+                "--prompt=Open on GitHub> ",
+                "--header=Type to filter · Tab to mark · Enter to open",
+            ],
+            input="\n".join(choices),
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if result.returncode not in (0, 1):
+            raise SystemExit(f"fzf failed with status {result.returncode}.")
+        selected_identifiers = {line.split("\t", 1)[0] for line in result.stdout.splitlines()}
+        return [entry for entry in entries if entry.identifier in selected_identifiers]
+
+    print("Enter row numbers separated by commas, 'a' for all, or press Enter to cancel.")
+    answer = input("Open> ").strip().lower()
+    if answer == "a":
+        return entries
+    try:
+        indices = {int(value.strip()) for value in answer.split(",") if value.strip()}
+    except ValueError as error:
+        raise SystemExit("Please enter comma-separated row numbers.") from error
+    return [entry for index, entry in enumerate(entries, start=1) if index in indices]
+
+
+def open_entries(entries: list[Entry]) -> None:
+    for entry in entries:
+        print(f"Opening {entry.url}")
+        webbrowser.open_new_tab(entry.url)
+
+
+def show_history(database: sqlite3.Connection, kind: str, limit: int) -> list[Entry]:
+    rows = database.execute(
+        """
+        SELECT identifier, url, description, language, stars, gained_stars, trending_range
+        FROM seen WHERE kind = ?
+        ORDER BY first_seen_at DESC
+        LIMIT ?
+        """,
+        (kind, limit),
+    ).fetchall()
+    return [Entry(*row) for row in rows]
+
+
+def parse_arguments() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Show GitHub Trending repositories or developers not displayed before."
+    )
+    parser.add_argument(
+        "command",
+        nargs="?",
+        default="all",
+        choices=("all", *RANGES, "history"),
+        help="all time ranges (default), one time range, or history",
+    )
+    parser.add_argument("--language", help="repository language, e.g. python or rust")
+    parser.add_argument("--developers", action="store_true", help="track Trending Developers instead")
+    parser.add_argument("--open", action="store_true", help="interactively select entries to open")
+    parser.add_argument("--limit", type=int, default=50, help="maximum history entries (default: 50)")
+    return parser.parse_args()
+
+
+def main() -> None:
+    arguments = parse_arguments()
+    if arguments.limit < 1:
+        raise SystemExit("--limit must be positive.")
+    if arguments.command == "history" and arguments.language:
+        raise SystemExit("--language cannot be used with history.")
+
+    kind = "developer" if arguments.developers else "repository"
+    console = make_console()
+    database = connect_database()
+    try:
+        if arguments.command == "history":
+            entries = show_history(database, kind, arguments.limit)
+            if not entries:
+                print(f"No {kind} entries have been recorded yet.")
+                return
+            print_entries(
+                entries,
+                console,
+                kind=kind,
+                time_range=None,
+                language=None,
+                history=True,
+                show_range=True,
+            )
+        else:
+            entries = []
+            ranges = RANGES if arguments.command == "all" else (arguments.command,)
+            for time_range in ranges:
+                fetched_entries = (
+                    fetch_developers(time_range)
+                    if arguments.developers
+                    else fetch_repositories(time_range, arguments.language)
+                )
+                new_entries = unseen_entries(database, kind, fetched_entries)
+                if not new_entries:
+                    continue
+                if entries:
+                    console.print()
+                print_entries(
+                    new_entries,
+                    console,
+                    kind=kind,
+                    time_range=time_range,
+                    language=arguments.language,
+                    history=False,
+                    show_range=arguments.command == "all",
+                    start_index=len(entries) + 1,
+                )
+                record_seen(database, kind, new_entries)
+                entries.extend(new_entries)
+
+            if not entries:
+                print(f"No unseen trending {kind} entries.")
+                return
+
+        if arguments.open:
+            open_entries(
+                select_entries(entries, show_range=arguments.command in ("all", "history"))
+            )
+    finally:
+        database.close()
+
+
+if __name__ == "__main__":
+    main()
