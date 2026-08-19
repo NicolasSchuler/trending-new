@@ -18,6 +18,36 @@ from pathlib import Path
 from typing import Callable, Iterable, Iterator
 from urllib.parse import quote
 
+
+def _bootstrap_into_venv() -> None:
+    """Re-exec with the bundled ``.venv`` interpreter when deps are missing.
+
+    The executable is typically invoked through a symlink on ``PATH`` (e.g.
+    ``~/.local/bin/trending-new``) whose ``#!/usr/bin/env python3`` shebang can
+    resolve to a system Python without this project's dependencies. When that
+    happens, re-run the real script with the virtualenv's Python so the tool
+    works regardless of how it was launched.
+    """
+
+    import importlib.util
+
+    if importlib.util.find_spec("requests") is not None:
+        return
+
+    script = Path(__file__).resolve()
+    venv_python = script.parent / ".venv" / "bin" / "python"
+    if not venv_python.exists():
+        return
+
+    current = Path(sys.executable).resolve()
+    if current == venv_python.resolve():
+        return
+
+    os.execv(str(venv_python), [str(venv_python), str(script), *sys.argv[1:]])
+
+
+_bootstrap_into_venv()
+
 import requests
 from bs4 import BeautifulSoup
 from rich import box
