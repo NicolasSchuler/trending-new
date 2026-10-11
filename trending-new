@@ -4,15 +4,17 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import shutil
 import sqlite3
 import subprocess
 import sys
+import time
 import webbrowser
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Iterable, Iterator
@@ -39,8 +41,9 @@ def _bootstrap_into_venv() -> None:
     if not venv_python.exists():
         return
 
-    current = Path(sys.executable).resolve()
-    if current == venv_python.resolve():
+    # Compare prefixes, not interpreters: the venv's python is a symlink to a
+    # base interpreter that does not have the dependencies installed.
+    if Path(sys.prefix).resolve() == (script.parent / ".venv").resolve():
         return
 
     os.execv(str(venv_python), [str(venv_python), str(script), *sys.argv[1:]])
@@ -57,7 +60,10 @@ from rich.text import Text
 
 RANGES = ("daily", "weekly", "monthly")
 DEFAULT_TIMEOUT_SECONDS = 20
-USER_AGENT = "trending-new/1.1 (+https://github.com)"
+USER_AGENT = "trending-new/1.2"
+FETCH_ATTEMPTS = 3
+RETRY_BACKOFF_SECONDS = 1
+MAX_RETRY_DELAY_SECONDS = 30
 RANGE_LABELS = {"daily": "day", "weekly": "week", "monthly": "month"}
 RANGE_SHORT_LABELS = {"daily": "day", "weekly": "wk", "monthly": "mo"}
 
@@ -71,6 +77,7 @@ class Entry:
     stars: int | None = None
     gained_stars: int | None = None
     trending_range: str | None = None
+    popular_repo: str | None = None
 
 
 def state_path() -> Path:
@@ -123,6 +130,7 @@ def connect_database() -> sqlite3.Connection:
                 ("stars", "INTEGER"),
                 ("gained_stars", "INTEGER"),
                 ("trending_range", "TEXT"),
+                ("popular_repo", "TEXT"),
             ):
                 if column not in existing_columns:
                     database.execute(f"ALTER TABLE seen ADD COLUMN {column} {column_type}")
@@ -142,18 +150,46 @@ def make_console() -> Console:
     )
 
 
-def fetch_page(url: str, params: dict[str, str]) -> BeautifulSoup:
-    try:
-        response = requests.get(
-            url,
-            params=params,
-            headers={"User-Agent": USER_AGENT},
-            timeout=DEFAULT_TIMEOUT_SECONDS,
-        )
-        response.raise_for_status()
-    except requests.RequestException as error:
-        raise SystemExit(f"Could not fetch GitHub Trending: {error}") from error
-    return BeautifulSoup(response.text, "html.parser")
+def retry_delay(attempt: int, response: requests.Response | None) -> float:
+    delay = RETRY_BACKOFF_SECONDS * 2 ** (attempt - 1)
+    retry_after = response.headers.get("Retry-After", "").strip() if response is not None else ""
+    if retry_after.isdigit():
+        delay = int(retry_after)
+    return min(delay, MAX_RETRY_DELAY_SECONDS)
+
+
+def fetch_page(
+    url: str, params: dict[str, str], *, sleep: Callable[[float], None] = time.sleep
+) -> BeautifulSoup:
+    for attempt in range(1, FETCH_ATTEMPTS + 1):
+        try:
+            response = requests.get(
+                url,
+                params=params,
+                headers={"User-Agent": USER_AGENT},
+                timeout=DEFAULT_TIMEOUT_SECONDS,
+            )
+            response.raise_for_status()
+            return BeautifulSoup(response.text, "html.parser")
+        except requests.RequestException as error:
+            failed_response = error.response
+            status = failed_response.status_code if failed_response is not None else None
+            transient = (
+                isinstance(error, (requests.ConnectionError, requests.Timeout))
+                or status == 429
+                or (status is not None and status >= 500)
+            )
+            if not transient or attempt == FETCH_ATTEMPTS:
+                raise SystemExit(f"Could not fetch GitHub Trending: {error}") from error
+            delay = retry_delay(attempt, failed_response)
+            reason = f"HTTP {status}" if status is not None else type(error).__name__
+            print(
+                f"GitHub Trending request failed ({reason}); retrying in {delay:g}s "
+                f"(attempt {attempt + 1} of {FETCH_ATTEMPTS})...",
+                file=sys.stderr,
+            )
+            sleep(delay)
+    raise AssertionError("unreachable")
 
 
 def clean_text(node: object | None) -> str:
@@ -165,11 +201,16 @@ def parse_count(text: str) -> int | None:
     return int(match.group().replace(",", "")) if match else None
 
 
-def fetch_repositories(time_range: str, language: str | None) -> list[Entry]:
+def fetch_repositories(
+    time_range: str, language: str | None, spoken_language: str | None = None
+) -> list[Entry]:
     url = "https://github.com/trending"
     if language:
         url += "/" + quote(language, safe="")
-    document = fetch_page(url, {"since": time_range})
+    params = {"since": time_range}
+    if spoken_language:
+        params["spoken_language_code"] = spoken_language
+    document = fetch_page(url, params)
 
     entries: list[Entry] = []
     for row in document.select("article.Box-row"):
@@ -214,8 +255,15 @@ def fetch_developers(time_range: str) -> list[Entry]:
         identifier = link["href"].strip("/")
         if not identifier or "/" in identifier:
             continue
+        popular_link = row.select_one("article h1.h4 a[href]")
+        popular_repo = popular_link["href"].strip("/") if popular_link else ""
         entries.append(
-            Entry(identifier, f"https://github.com/{identifier}", clean_text(row.select_one("p")))
+            Entry(
+                identifier,
+                f"https://github.com/{identifier}",
+                clean_text(row.select_one("p")),
+                popular_repo=popular_repo if popular_repo.count("/") == 1 else None,
+            )
         )
 
     if not entries:
@@ -244,8 +292,8 @@ def record_seen(database: sqlite3.Connection, kind: str, entries: Iterable[Entry
         """
         INSERT INTO seen(
             kind, identifier, first_seen_at, last_seen_at, url, description,
-            language, stars, gained_stars, trending_range
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            language, stars, gained_stars, trending_range, popular_repo
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(kind, identifier) DO UPDATE SET
             last_seen_at = excluded.last_seen_at,
             url = excluded.url,
@@ -253,7 +301,8 @@ def record_seen(database: sqlite3.Connection, kind: str, entries: Iterable[Entry
             language = excluded.language,
             stars = excluded.stars,
             gained_stars = excluded.gained_stars,
-            trending_range = excluded.trending_range
+            trending_range = excluded.trending_range,
+            popular_repo = excluded.popular_repo
         """,
         [
             (
@@ -267,6 +316,7 @@ def record_seen(database: sqlite3.Connection, kind: str, entries: Iterable[Entry
                 entry.stars,
                 entry.gained_stars,
                 entry.trending_range,
+                entry.popular_repo,
             )
             for entry in entries
         ],
@@ -278,7 +328,15 @@ def process_unseen_entries(
     kind: str,
     entries: Iterable[Entry],
     display: Callable[[list[Entry]], None],
+    *,
+    record: bool = True,
 ) -> list[Entry]:
+    if not record:
+        new_entries = unseen_entries(database, kind, entries)
+        if new_entries:
+            display(new_entries)
+        return new_entries
+
     with immediate_transaction(database):
         new_entries = unseen_entries(database, kind, entries)
         if new_entries:
@@ -386,11 +444,18 @@ def developer_table(entries: list[Entry], *, start_index: int = 1) -> Table:
     table = new_table()
     table.add_column("#", justify="right", width=3)
     table.add_column("DEVELOPER", min_width=20)
+    table.add_column("POPULAR REPO", min_width=20)
     table.add_column("PROFILE NAME", ratio=1)
     for index, entry in enumerate(entries, start=start_index):
+        popular_repo = (
+            Text(entry.popular_repo, style=f"cyan link https://github.com/{entry.popular_repo}")
+            if entry.popular_repo
+            else Text("—")
+        )
         table.add_row(
             str(index),
             Text(entry.identifier, style=f"bold cyan link {entry.url}"),
+            popular_repo,
             entry.description or "—",
         )
     return table
@@ -406,13 +471,19 @@ def print_entries(
     history: bool,
     show_range: bool,
     start_index: int = 1,
+    spoken_language: str | None = None,
 ) -> None:
     if history:
         title = f"Previously shown GitHub Trending {'developers' if kind == 'developer' else 'repositories'}"
-        subtitle = f"{len(entries)} recorded locally · select with --open to revisit"
+        subtitle = (
+            f"{len(entries)} recorded locally · stars and gains as first shown"
+            " · --open to revisit"
+        )
     elif kind == "repository":
         source_language = language or "all languages"
         title = f"GitHub Trending · {time_range.title()} · {source_language}"
+        if spoken_language:
+            title += f" · spoken language {spoken_language}"
         subtitle = f"{len(entries)} new repositories · total stars and gain this {RANGE_LABELS[time_range]}"
     else:
         title = f"GitHub Trending Developers · {time_range.title()}"
@@ -427,7 +498,12 @@ def print_entries(
     )
 
 
-def picker_label(entry: Entry, index: int, *, show_range: bool) -> str:
+def picker_label(entry: Entry, index: int, *, show_range: bool, kind: str = "repository") -> str:
+    if kind == "developer":
+        return (
+            f"{index:>2}  {entry.identifier:<24.24}  {(entry.popular_repo or '—'):<40.40}  "
+            f"{entry.description}"
+        )
     if entry.language or entry.stars is not None or entry.gained_stars is not None:
         return (
             f"{index:>2}  {entry.identifier:<34.34}  {(entry.language or '—'):<12.12} "
@@ -436,13 +512,15 @@ def picker_label(entry: Entry, index: int, *, show_range: bool) -> str:
     return f"{index:>2}  {entry.identifier:<34.34}  {entry.description}"
 
 
-def select_entries(entries: list[Entry], *, show_range: bool) -> list[Entry]:
+def select_entries(
+    entries: list[Entry], *, show_range: bool, kind: str = "repository"
+) -> list[Entry]:
     if not sys.stdin.isatty():
         raise SystemExit("--open needs an interactive terminal.")
 
     if shutil.which("fzf"):
         choices = [
-            f"{entry.identifier}\t{picker_label(entry, index, show_range=show_range)}"
+            f"{entry.identifier}\t{picker_label(entry, index, show_range=show_range, kind=kind)}"
             for index, entry in enumerate(entries, start=1)
         ]
         result = subprocess.run(
@@ -481,17 +559,71 @@ def open_entries(entries: list[Entry]) -> None:
         webbrowser.open_new_tab(entry.url)
 
 
-def show_history(database: sqlite3.Connection, kind: str, limit: int) -> list[Entry]:
+def normalize_language(value: str | None) -> str | None:
+    return value.casefold().replace(" ", "-") if value else None
+
+
+def contains_text(haystack: str | None, needle: str) -> bool:
+    return needle in (haystack or "").casefold()
+
+
+def show_history(
+    database: sqlite3.Connection,
+    kind: str,
+    limit: int,
+    languages: list[str] | None = None,
+    search: str | None = None,
+) -> list[Entry]:
+    database.create_function("normalize_language", 1, normalize_language, deterministic=True)
+    database.create_function("contains_text", 2, contains_text, deterministic=True)
+
+    conditions = ["kind = ?"]
+    parameters: list[object] = [kind]
+    if languages:
+        normalized = {normalize_language(language) for language in languages}
+        conditions.append(f"normalize_language(language) IN ({', '.join('?' * len(normalized))})")
+        parameters.extend(normalized)
+    if search:
+        conditions.append("(contains_text(identifier, ?) OR contains_text(description, ?))")
+        parameters.extend([search.casefold()] * 2)
     rows = database.execute(
-        """
-        SELECT identifier, url, description, language, stars, gained_stars, trending_range
-        FROM seen WHERE kind = ?
+        f"""
+        SELECT identifier, url, description, language, stars, gained_stars,
+               trending_range, popular_repo
+        FROM seen WHERE {" AND ".join(conditions)}
         ORDER BY first_seen_at DESC
         LIMIT ?
         """,
-        (kind, limit),
+        (*parameters, limit),
     ).fetchall()
     return [Entry(*row) for row in rows]
+
+
+def forget_entries(database: sqlite3.Connection, kind: str, identifiers: list[str]) -> None:
+    removed: list[str] = []
+    missing: list[str] = []
+    with immediate_transaction(database):
+        for identifier in dict.fromkeys(value.strip().strip("/") for value in identifiers):
+            deleted = database.execute(
+                "DELETE FROM seen WHERE kind = ? AND identifier = ? COLLATE NOCASE",
+                (kind, identifier),
+            ).rowcount
+            (removed if deleted else missing).append(identifier)
+
+    if removed:
+        noun = "entry" if len(removed) == 1 else "entries"
+        print(f"Forgot {len(removed)} {kind} {noun}: {', '.join(removed)}")
+    if missing:
+        print(f"Not found in {kind} history: {', '.join(missing)}", file=sys.stderr)
+        raise SystemExit(1)
+
+
+def print_json(entries: list[Entry], kind: str) -> None:
+    records = [
+        {"kind": kind, **asdict(entry), "description": entry.description or None}
+        for entry in entries
+    ]
+    print(json.dumps(records, ensure_ascii=False, indent=2))
 
 
 def parse_arguments() -> argparse.Namespace:
@@ -502,31 +634,97 @@ def parse_arguments() -> argparse.Namespace:
         "command",
         nargs="?",
         default="all",
-        choices=("all", *RANGES, "history"),
-        help="all time ranges (default), one time range, or history",
+        choices=("all", *RANGES, "history", "forget"),
+        help="all time ranges (default), one time range, history, or forget to un-record entries",
     )
-    parser.add_argument("--language", help="repository language, e.g. python or rust")
+    parser.add_argument(
+        "identifiers",
+        nargs="*",
+        metavar="IDENTIFIER",
+        help="forget only: owner/repo (or developer login with --developers) to show again",
+    )
+    parser.add_argument(
+        "--language",
+        action="append",
+        help="repository language, e.g. python or rust; repeat to combine (history: filter)",
+    )
+    parser.add_argument(
+        "--spoken-language",
+        metavar="CODE",
+        help="spoken language of repository descriptions, e.g. en or zh",
+    )
     parser.add_argument("--developers", action="store_true", help="track Trending Developers instead")
     parser.add_argument("--open", action="store_true", help="interactively select entries to open")
+    parser.add_argument(
+        "--peek", action="store_true", help="show unseen entries without recording them as seen"
+    )
+    parser.add_argument("--json", action="store_true", help="print a JSON array instead of a table")
+    parser.add_argument("--search", help="history only: text in the identifier or description")
     parser.add_argument("--limit", type=int, default=50, help="maximum history entries (default: 50)")
-    return parser.parse_args()
+    return parser.parse_intermixed_args()
+
+
+def validate_arguments(arguments: argparse.Namespace) -> None:
+    command = arguments.command
+    if arguments.limit < 1:
+        raise SystemExit("--limit must be positive.")
+    if command == "forget":
+        if not arguments.identifiers:
+            raise SystemExit("forget needs at least one identifier, e.g. owner/repo.")
+        for option, used in (
+            ("--open", arguments.open),
+            ("--json", arguments.json),
+            ("--peek", arguments.peek),
+            ("--language", arguments.language),
+            ("--spoken-language", arguments.spoken_language),
+            ("--search", arguments.search),
+        ):
+            if used:
+                raise SystemExit(f"{option} cannot be used with forget.")
+    elif arguments.identifiers:
+        raise SystemExit("Identifiers are only accepted by the forget command.")
+    if arguments.json and arguments.open:
+        raise SystemExit("--json cannot be combined with --open.")
+    if arguments.search and command != "history":
+        raise SystemExit("--search can only be used with history.")
+    if command == "history":
+        if arguments.peek:
+            raise SystemExit("--peek cannot be used with history.")
+        if arguments.spoken_language:
+            raise SystemExit("--spoken-language cannot be used with history.")
+    if arguments.developers:
+        if arguments.spoken_language:
+            raise SystemExit("--spoken-language cannot be used with --developers.")
+        if arguments.language:
+            raise SystemExit("--language cannot be used with --developers.")
 
 
 def main() -> None:
     arguments = parse_arguments()
-    if arguments.limit < 1:
-        raise SystemExit("--limit must be positive.")
-    if arguments.command == "history" and arguments.language:
-        raise SystemExit("--language cannot be used with history.")
+    validate_arguments(arguments)
 
     kind = "developer" if arguments.developers else "repository"
     console = make_console()
     database = connect_database()
     try:
+        if arguments.command == "forget":
+            forget_entries(database, kind, arguments.identifiers)
+            return
+
         if arguments.command == "history":
-            entries = show_history(database, kind, arguments.limit)
+            entries = show_history(
+                database, kind, arguments.limit, arguments.language, arguments.search
+            )
+            if arguments.json:
+                print_json(entries, kind)
+                return
             if not entries:
-                print(f"No {kind} entries have been recorded yet.")
+                filtered = arguments.language or arguments.search
+                print(
+                    f"No {kind} entries match the filters."
+                    if filtered
+                    else f"No {kind} entries have been recorded yet."
+                )
                 return
             print_entries(
                 entries,
@@ -539,41 +737,62 @@ def main() -> None:
             )
         else:
             entries = []
+            shown_identifiers: set[str] = set()
             ranges = RANGES if arguments.command == "all" else (arguments.command,)
+            languages = list(dict.fromkeys(arguments.language or [None]))
             for time_range in ranges:
-                fetched_entries = (
-                    fetch_developers(time_range)
-                    if arguments.developers
-                    else fetch_repositories(time_range, arguments.language)
-                )
-                def display(new_entries: list[Entry]) -> None:
-                    if entries:
-                        console.print()
-                    print_entries(
-                        new_entries,
-                        console,
-                        kind=kind,
-                        time_range=time_range,
-                        language=arguments.language,
-                        history=False,
-                        show_range=arguments.command == "all",
-                        start_index=len(entries) + 1,
+                for language in languages:
+                    fetched_entries = (
+                        fetch_developers(time_range)
+                        if arguments.developers
+                        else fetch_repositories(
+                            time_range, language, spoken_language=arguments.spoken_language
+                        )
                     )
+                    # Peeking records nothing, so repeat appearances are filtered in memory.
+                    fetched_entries = [
+                        entry
+                        for entry in fetched_entries
+                        if entry.identifier not in shown_identifiers
+                    ]
 
-                new_entries = process_unseen_entries(
-                    database, kind, fetched_entries, display
-                )
-                if not new_entries:
-                    continue
-                entries.extend(new_entries)
+                    def display(
+                        new_entries: list[Entry], time_range: str = time_range, language: str | None = language
+                    ) -> None:
+                        if arguments.json:
+                            return
+                        if entries:
+                            console.print()
+                        print_entries(
+                            new_entries,
+                            console,
+                            kind=kind,
+                            time_range=time_range,
+                            language=language,
+                            history=False,
+                            show_range=arguments.command == "all",
+                            start_index=len(entries) + 1,
+                            spoken_language=arguments.spoken_language,
+                        )
 
+                    new_entries = process_unseen_entries(
+                        database, kind, fetched_entries, display, record=not arguments.peek
+                    )
+                    entries.extend(new_entries)
+                    shown_identifiers.update(entry.identifier for entry in new_entries)
+
+            if arguments.json:
+                print_json(entries, kind)
+                return
             if not entries:
                 print(f"No unseen trending {kind} entries.")
                 return
 
         if arguments.open:
             open_entries(
-                select_entries(entries, show_range=arguments.command in ("all", "history"))
+                select_entries(
+                    entries, show_range=arguments.command in ("all", "history"), kind=kind
+                )
             )
     finally:
         database.close()

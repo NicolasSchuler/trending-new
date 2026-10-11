@@ -1,5 +1,6 @@
 import importlib.machinery
 import importlib.util
+import json
 import os
 import shutil
 import sqlite3
@@ -14,6 +15,7 @@ from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
 
+import requests
 
 SCRIPT = Path(__file__).with_name("trending-new")
 loader = importlib.machinery.SourceFileLoader("trending_new", str(SCRIPT))
@@ -107,7 +109,9 @@ class TrendingNewTests(unittest.TestCase):
             columns = {row[1] for row in database.execute("PRAGMA table_info(seen)")}
             database.close()
 
-        self.assertTrue({"language", "stars", "gained_stars", "trending_range"} <= columns)
+        self.assertTrue(
+            {"language", "stars", "gained_stars", "trending_range", "popular_repo"} <= columns
+        )
 
     def test_picker_label_and_browser_opening(self):
         label = module.picker_label(self.entry, 1, show_range=False)
@@ -145,7 +149,9 @@ class TrendingNewTests(unittest.TestCase):
         ), patch.object(
             module,
             "fetch_repositories",
-            side_effect=lambda time_range, language: list(results[time_range]),
+            side_effect=lambda time_range, language, spoken_language=None: list(
+                results[time_range]
+            ),
         ) as fetch:
             output = StringIO()
             with patch.object(sys, "argv", ["trending-new"]), redirect_stdout(output):
@@ -254,7 +260,13 @@ class TrendingNewTests(unittest.TestCase):
                 futures = [executor.submit(migrate) for _ in range(2)]
                 migrated_columns = [future.result(timeout=10) for future in futures]
 
-        expected_columns = {"language", "stars", "gained_stars", "trending_range"}
+        expected_columns = {
+            "language",
+            "stars",
+            "gained_stars",
+            "trending_range",
+            "popular_repo",
+        }
         for columns in migrated_columns:
             self.assertTrue(expected_columns <= columns)
 
@@ -383,6 +395,383 @@ class TrendingNewTests(unittest.TestCase):
         with patch.object(module, "fetch_page", return_value=malformed_page):
             with self.assertRaisesRegex(SystemExit, "page structure may have changed"):
                 module.fetch_repositories("daily", None)
+
+    def test_launcher_reexecs_when_run_with_the_venv_base_interpreter(self):
+        venv_python = SCRIPT.parent / ".venv" / "bin" / "python"
+        if not venv_python.exists():
+            self.skipTest("no .venv next to the script")
+        base_python = venv_python.resolve()
+        if base_python == venv_python or subprocess.run(
+            [str(base_python), "-c", "import requests"], capture_output=True, check=False
+        ).returncode == 0:
+            self.skipTest("the venv's base interpreter is not distinct from the venv")
+
+        environment = os.environ.copy()
+        environment["PYTHONDONTWRITEBYTECODE"] = "1"
+        result = subprocess.run(
+            [str(base_python), str(SCRIPT), "--help"],
+            env=environment,
+            text=True,
+            capture_output=True,
+            timeout=10,
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Show GitHub Trending", result.stdout)
+
+
+class FetchPageRetryTests(unittest.TestCase):
+    @staticmethod
+    def response(status, headers=None, body="<html></html>"):
+        response = requests.Response()
+        response.status_code = status
+        response._content = body.encode()
+        response.headers.update(headers or {})
+        response.url = "https://github.com/trending"
+        return response
+
+    def fetch(self, responses):
+        sleeps = []
+        with patch.object(module.requests, "get", side_effect=responses) as get:
+            try:
+                page = module.fetch_page("https://github.com/trending", {}, sleep=sleeps.append)
+            except SystemExit as error:
+                return error, sleeps, get
+        return page, sleeps, get
+
+    def test_transient_failures_are_retried_with_backoff(self):
+        errors = StringIO()
+        with patch.object(sys, "stderr", errors):
+            page, sleeps, get = self.fetch(
+                [
+                    requests.ConnectionError("connection reset"),
+                    self.response(503),
+                    self.response(200, body="<p>ok</p>"),
+                ]
+            )
+
+        self.assertEqual(page.get_text(), "ok")
+        self.assertEqual(sleeps, [1, 2])
+        self.assertEqual(get.call_count, 3)
+        self.assertIn("ConnectionError", errors.getvalue())
+        self.assertIn("HTTP 503", errors.getvalue())
+        self.assertIn("retrying in 2s", errors.getvalue())
+
+    def test_retry_after_is_honored_and_capped(self):
+        with patch.object(sys, "stderr", StringIO()):
+            _, sleeps, _ = self.fetch(
+                [
+                    self.response(429, {"Retry-After": "7"}),
+                    self.response(429, {"Retry-After": "3600"}),
+                    self.response(200),
+                ]
+            )
+
+        self.assertEqual(sleeps, [7, module.MAX_RETRY_DELAY_SECONDS])
+
+    def test_timeout_is_retried_and_final_failure_exits(self):
+        with patch.object(sys, "stderr", StringIO()):
+            error, sleeps, get = self.fetch([requests.Timeout("slow")] * 3)
+
+        self.assertIsInstance(error, SystemExit)
+        self.assertIn("Could not fetch GitHub Trending", str(error))
+        self.assertEqual(sleeps, [1, 2])
+        self.assertEqual(get.call_count, 3)
+
+    def test_non_transient_client_error_fails_immediately(self):
+        error, sleeps, get = self.fetch([self.response(404)])
+
+        self.assertIsInstance(error, SystemExit)
+        self.assertIn("404", str(error))
+        self.assertEqual(sleeps, [])
+        self.assertEqual(get.call_count, 1)
+
+
+DEVELOPER_FIXTURE = """
+<article class="Box-row d-flex" id="pa-alice">
+  <div class="col-md-6">
+    <h1 class="h3 lh-condensed"><a href="/alice">Alice A.</a></h1>
+    <p class="f4 text-normal mb-1"><a href="/alice">alice</a></p>
+  </div>
+  <div class="col-md-6">
+    <article>
+      <div class="f6 color-fg-muted text-uppercase mb-1">Popular repo</div>
+      <h1 class="h4 lh-condensed"><a href="/alice/fast-tool"><svg></svg> fast-tool</a></h1>
+      <div class="f6 color-fg-muted mt-1">A fast tool.</div>
+    </article>
+  </div>
+</article>
+<article class="Box-row d-flex" id="pa-bob">
+  <div class="col-md-6">
+    <h1 class="h3 lh-condensed"><a href="/bob">Bob B.</a></h1>
+    <p class="f4 text-normal mb-1"><a href="/bob">bob</a></p>
+  </div>
+</article>
+"""
+
+
+class FeatureTests(unittest.TestCase):
+    def setUp(self):
+        self.data_home = tempfile.TemporaryDirectory()
+        self.addCleanup(self.data_home.cleanup)
+        patcher = patch.dict(os.environ, {"XDG_DATA_HOME": self.data_home.name})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    @staticmethod
+    def repository(identifier, language="Python", description="A project.", time_range="daily"):
+        return module.Entry(
+            identifier,
+            f"https://github.com/{identifier}",
+            description,
+            language,
+            1_000,
+            100,
+            time_range,
+        )
+
+    def run_main(self, *arguments, fetched=None):
+        output = StringIO()
+        patches = [
+            patch.object(sys, "argv", ["trending-new", *arguments]),
+            redirect_stdout(output),
+        ]
+        if fetched is not None:
+            patches.append(patch.object(module, "fetch_repositories", side_effect=fetched))
+        for context in patches:
+            context.__enter__()
+        try:
+            module.main()
+        finally:
+            for context in reversed(patches):
+                context.__exit__(None, None, None)
+        return output.getvalue()
+
+    def record(self, kind, *entries):
+        database = module.connect_database()
+        try:
+            with module.immediate_transaction(database):
+                module.record_seen(database, kind, entries)
+        finally:
+            database.close()
+
+    def seen_identifiers(self):
+        database = module.connect_database()
+        try:
+            return {row[0] for row in database.execute("SELECT identifier FROM seen")}
+        finally:
+            database.close()
+
+    def test_developer_parser_extracts_popular_repo_when_present(self):
+        document = module.BeautifulSoup(DEVELOPER_FIXTURE, "html.parser")
+        with patch.object(module, "fetch_page", return_value=document):
+            entries = module.fetch_developers("daily")
+
+        self.assertEqual([entry.identifier for entry in entries], ["alice", "bob"])
+        self.assertEqual(entries[0].popular_repo, "alice/fast-tool")
+        self.assertIsNone(entries[1].popular_repo)
+
+    def test_developer_table_history_and_picker_show_popular_repo(self):
+        alice = module.Entry("alice", "https://github.com/alice", "alice", popular_repo="alice/fast-tool")
+        bob = module.Entry("bob", "https://github.com/bob", "bob")
+        self.record("developer", alice, bob)
+        database = module.connect_database()
+        try:
+            history = module.show_history(database, "developer", 10)
+        finally:
+            database.close()
+        self.assertEqual({entry.identifier: entry.popular_repo for entry in history},
+                         {"alice": "alice/fast-tool", "bob": None})
+
+        console = module.Console(width=120, no_color=True)
+        with console.capture() as capture:
+            console.print(module.developer_table(history))
+        self.assertIn("POPULAR REPO", capture.get())
+        self.assertIn("alice/fast-tool", capture.get())
+        self.assertIn("—", capture.get())
+        self.assertIn(
+            "alice/fast-tool", module.picker_label(alice, 1, show_range=False, kind="developer")
+        )
+
+    def test_peek_records_nothing_but_deduplicates_across_batches(self):
+        shared = self.repository("owner/shared")
+        results = {"daily": [shared], "weekly": [shared, self.repository("owner/weekly")]}
+
+        def fetched(time_range, language, spoken_language=None):
+            return list(results.get(time_range, []))
+
+        first = self.run_main("--peek", "--json", fetched=fetched)
+        second = self.run_main("--peek", "--json", fetched=fetched)
+
+        self.assertEqual(
+            [item["identifier"] for item in json.loads(first)], ["owner/shared", "owner/weekly"]
+        )
+        self.assertEqual(first, second)
+        self.assertEqual(self.seen_identifiers(), set())
+
+        self.run_main(fetched=fetched)
+        self.assertEqual(self.seen_identifiers(), {"owner/shared", "owner/weekly"})
+
+    def test_forget_makes_an_entry_unseen_again(self):
+        repository = self.repository("owner/project")
+        self.record("repository", repository, self.repository("owner/other"))
+
+        errors = StringIO()
+        with patch.object(sys, "stderr", errors), self.assertRaises(SystemExit) as raised:
+            output = self.run_main("forget", "Owner/Project", "owner/missing")
+        self.assertEqual(raised.exception.code, 1)
+        self.assertIn("owner/missing", errors.getvalue())
+        self.assertEqual(self.seen_identifiers(), {"owner/other"})
+
+        output = self.run_main(
+            "daily", fetched=lambda time_range, language, spoken_language=None: [repository]
+        )
+        self.assertIn("owner/project", output)
+
+    def test_forget_respects_kind_and_requires_identifiers(self):
+        self.record("developer", module.Entry("alice", "https://github.com/alice", ""))
+        self.record("repository", self.repository("alice/project"))
+
+        output = self.run_main("forget", "--developers", "alice")
+        self.assertIn("Forgot 1", output)
+        self.assertEqual(self.seen_identifiers(), {"alice/project"})
+
+        with patch.object(sys, "argv", ["trending-new", "forget"]), self.assertRaisesRegex(
+            SystemExit, "at least one identifier"
+        ):
+            module.main()
+
+    def test_json_output_for_fetch_and_history(self):
+        repository = self.repository("owner/project", language=None, description="")
+        output = self.run_main(
+            "daily", "--json", fetched=lambda time_range, language, spoken_language=None: [repository]
+        )
+        [record] = json.loads(output)
+        self.assertEqual(record["kind"], "repository")
+        self.assertEqual(record["identifier"], "owner/project")
+        self.assertIsNone(record["language"])
+        self.assertIsNone(record["description"])
+        self.assertIsNone(record["popular_repo"])
+        self.assertEqual(record["gained_stars"], 100)
+
+        self.assertEqual([item["identifier"] for item in json.loads(self.run_main("history", "--json"))],
+                         ["owner/project"])
+        self.assertEqual(
+            self.run_main(
+                "daily", "--json", fetched=lambda time_range, language, spoken_language=None: [repository]
+            ).strip(),
+            "[]",
+        )
+
+    def test_history_filters_apply_before_the_limit(self):
+        database = module.connect_database()
+        try:
+            with module.immediate_transaction(database):
+                for index, (identifier, language, description) in enumerate(
+                    [
+                        ("a/notebook", "Jupyter Notebook", "Data exploration"),
+                        ("b/cpp", "C++", "Fast Library"),
+                        ("c/python", "Python", "Another library"),
+                        ("d/rust", "Rust", "Unrelated"),
+                    ]
+                ):
+                    module.record_seen(database, "repository", [self.repository(identifier, language, description)])
+                    database.execute(
+                        "UPDATE seen SET first_seen_at = ? WHERE identifier = ?",
+                        (f"2024-01-0{index + 1}", identifier),
+                    )
+
+            def identifiers(**filters):
+                return [
+                    entry.identifier
+                    for entry in module.show_history(database, "repository", 1, **filters)
+                ]
+
+            self.assertEqual(identifiers(languages=["jupyter-notebook"]), ["a/notebook"])
+            self.assertEqual(identifiers(languages=["c++"]), ["b/cpp"])
+            self.assertEqual(identifiers(languages=["JUPYTER NOTEBOOK", "c++"]), ["b/cpp"])
+            self.assertEqual(identifiers(search="LIBRARY"), ["c/python"])
+            self.assertEqual(identifiers(search="b/CPP"), ["b/cpp"])
+            self.assertEqual(identifiers(languages=["python"], search="fast"), [])
+        finally:
+            database.close()
+
+    def test_multiple_languages_and_spoken_language_are_fetched_per_range(self):
+        calls = []
+
+        def fetched(time_range, language, spoken_language=None):
+            calls.append((time_range, language, spoken_language))
+            return [self.repository(f"owner/{language}")]
+
+        output = self.run_main(
+            "daily", "--language", "python", "--language", "rust", "--spoken-language", "en",
+            fetched=fetched,
+        )
+
+        self.assertEqual(calls, [("daily", "python", "en"), ("daily", "rust", "en")])
+        self.assertIn("Daily · python · spoken language en", output)
+        self.assertIn("Daily · rust · spoken language en", output)
+
+    def test_spoken_language_is_sent_as_a_query_parameter(self):
+        empty_page = module.BeautifulSoup("", "html.parser")
+        with patch.object(module, "fetch_page", return_value=empty_page) as fetch, self.assertRaises(
+            SystemExit
+        ):
+            module.fetch_repositories("daily", None, spoken_language="zh")
+        self.assertEqual(fetch.call_args.args[1], {"since": "daily", "spoken_language_code": "zh"})
+
+    def test_incompatible_options_are_rejected(self):
+        cases = (
+            (["--json", "--open"], "--json cannot be combined with --open"),
+            (["--spoken-language", "en", "--developers"], "--spoken-language cannot be used with --developers"),
+            (["daily", "--search", "x"], "--search can only be used with history"),
+            (["history", "--peek"], "--peek cannot be used with history"),
+            (["daily", "owner/repo"], "only accepted by the forget command"),
+        )
+        for arguments, message in cases:
+            with self.subTest(arguments=arguments), patch.object(
+                sys, "argv", ["trending-new", *arguments]
+            ), self.assertRaisesRegex(SystemExit, message):
+                module.main()
+
+
+@unittest.skipUnless(os.environ.get("TRENDING_NEW_LIVE") == "1", "set TRENDING_NEW_LIVE=1 to hit GitHub")
+class LiveSmokeTests(unittest.TestCase):
+    def run_json(self, *arguments):
+        with tempfile.TemporaryDirectory() as data_home:
+            environment = os.environ.copy()
+            environment["XDG_DATA_HOME"] = data_home
+            result = subprocess.run(
+                [sys.executable, str(SCRIPT), *arguments, "--json", "--peek"],
+                env=environment,
+                text=True,
+                capture_output=True,
+                timeout=120,
+                check=False,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        records = json.loads(result.stdout)
+        self.assertTrue(records)
+        return records
+
+    def test_live_repositories_parse(self):
+        for record in self.run_json("daily"):
+            self.assertEqual(record["kind"], "repository")
+            self.assertEqual(record["identifier"].count("/"), 1)
+            self.assertTrue(record["url"].startswith("https://github.com/"))
+            self.assertIsInstance(record["stars"], int)
+            self.assertIsInstance(record["gained_stars"], int)
+            self.assertEqual(record["trending_range"], "daily")
+
+    def test_live_developers_parse(self):
+        records = self.run_json("daily", "--developers")
+        for record in records:
+            self.assertEqual(record["kind"], "developer")
+            self.assertNotIn("/", record["identifier"])
+        popular = [record["popular_repo"] for record in records if record["popular_repo"]]
+        self.assertTrue(popular)
+        self.assertTrue(all(name.count("/") == 1 for name in popular))
 
 
 if __name__ == "__main__":
