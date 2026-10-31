@@ -1,3 +1,14 @@
+"""Tests for the `trending-new` command-line script.
+
+The script has no `.py` extension, so it is loaded through `importlib` as the module
+`trending_new` and its functions are called directly. Tests that touch the state database point
+`XDG_DATA_HOME` at a temporary directory, and network access is replaced by patching
+`fetch_repositories`, `fetch_page`, or `requests.get`. Rendered tables and JSON are checked by
+capturing Rich console output or stdout, and a few tests run the script in a subprocess to check
+the launcher. `LiveSmokeTests` query github.com/trending and run only when `TRENDING_NEW_LIVE=1`
+is set.
+"""
+
 import importlib.machinery
 import importlib.util
 import json
@@ -26,7 +37,15 @@ loader.exec_module(module)
 
 
 class TrendingNewTests(unittest.TestCase):
+    """Tests for formatting, table rendering, state storage, page parsing, and the launcher.
+
+    Covers star-count and trend formatting, wide and narrow tables, picker labels, terminal-only
+    styling, the default all-range run, state path resolution, legacy schema migration,
+    concurrent use of the state database, empty Trending pages, and the executable launcher.
+    """
+
     def setUp(self):
+        """Create `self.entry`, a weekly-trending Python repository shared by most tests."""
         self.entry = module.Entry(
             "owner/repository",
             "https://github.com/owner/repository",
@@ -85,8 +104,9 @@ class TrendingNewTests(unittest.TestCase):
         self.assertIn("description.", output)
 
     def test_legacy_database_is_migrated(self):
-        with tempfile.TemporaryDirectory() as data_home, patch.dict(
-            os.environ, {"XDG_DATA_HOME": data_home}
+        with (
+            tempfile.TemporaryDirectory() as data_home,
+            patch.dict(os.environ, {"XDG_DATA_HOME": data_home}),
         ):
             database_file = Path(data_home) / "trending-new" / "state.sqlite3"
             database_file.parent.mkdir()
@@ -124,6 +144,7 @@ class TrendingNewTests(unittest.TestCase):
 
     def test_default_command_fetches_all_ranges_without_duplicates(self):
         def entry(identifier, time_range):
+            """Build a Python repository entry that trended during `time_range`."""
             return module.Entry(
                 identifier,
                 f"https://github.com/{identifier}",
@@ -144,15 +165,17 @@ class TrendingNewTests(unittest.TestCase):
             ],
         }
 
-        with tempfile.TemporaryDirectory() as data_home, patch.dict(
-            os.environ, {"XDG_DATA_HOME": data_home}
-        ), patch.object(
-            module,
-            "fetch_repositories",
-            side_effect=lambda time_range, language, spoken_language=None: list(
-                results[time_range]
-            ),
-        ) as fetch:
+        with (
+            tempfile.TemporaryDirectory() as data_home,
+            patch.dict(os.environ, {"XDG_DATA_HOME": data_home}),
+            patch.object(
+                module,
+                "fetch_repositories",
+                side_effect=lambda time_range, language, spoken_language=None: list(
+                    results[time_range]
+                ),
+            ) as fetch,
+        ):
             output = StringIO()
             with patch.object(sys, "argv", ["trending-new"]), redirect_stdout(output):
                 module.main()
@@ -194,7 +217,6 @@ class TrendingNewTests(unittest.TestCase):
         self.assertNotIn("⭐", plain_output)
         self.assertNotIn("🔥", plain_output)
 
-
     def test_state_path_uses_only_absolute_xdg_data_home(self):
         with tempfile.TemporaryDirectory() as root:
             root_path = Path(root)
@@ -209,22 +231,21 @@ class TrendingNewTests(unittest.TestCase):
             )
 
             for configured_home, expected_data_home in cases:
-                environment = (
-                    {}
-                    if configured_home is None
-                    else {"XDG_DATA_HOME": configured_home}
-                )
-                with self.subTest(configured_home=configured_home), patch.dict(
-                    os.environ, environment, clear=True
-                ), patch.object(module.Path, "home", return_value=home):
+                environment = {} if configured_home is None else {"XDG_DATA_HOME": configured_home}
+                with (
+                    self.subTest(configured_home=configured_home),
+                    patch.dict(os.environ, environment, clear=True),
+                    patch.object(module.Path, "home", return_value=home),
+                ):
                     self.assertEqual(
                         module.state_path(),
                         expected_data_home / "trending-new" / "state.sqlite3",
                     )
 
     def test_concurrent_legacy_migrations_are_serialized(self):
-        with tempfile.TemporaryDirectory() as data_home, patch.dict(
-            os.environ, {"XDG_DATA_HOME": data_home}
+        with (
+            tempfile.TemporaryDirectory() as data_home,
+            patch.dict(os.environ, {"XDG_DATA_HOME": data_home}),
         ):
             database_file = Path(data_home) / "trending-new" / "state.sqlite3"
             database_file.parent.mkdir()
@@ -246,13 +267,11 @@ class TrendingNewTests(unittest.TestCase):
             start = threading.Barrier(2)
 
             def migrate():
+                """Connect once both threads are ready and return the `seen` column names."""
                 start.wait(timeout=5)
                 database = module.connect_database()
                 try:
-                    return {
-                        row[1]
-                        for row in database.execute("PRAGMA table_info(seen)")
-                    }
+                    return {row[1] for row in database.execute("PRAGMA table_info(seen)")}
                 finally:
                     database.close()
 
@@ -271,8 +290,9 @@ class TrendingNewTests(unittest.TestCase):
             self.assertTrue(expected_columns <= columns)
 
     def test_concurrent_processing_displays_an_entry_once(self):
-        with tempfile.TemporaryDirectory() as data_home, patch.dict(
-            os.environ, {"XDG_DATA_HOME": data_home}
+        with (
+            tempfile.TemporaryDirectory() as data_home,
+            patch.dict(os.environ, {"XDG_DATA_HOME": data_home}),
         ):
             database = module.connect_database()
             database.close()
@@ -281,10 +301,16 @@ class TrendingNewTests(unittest.TestCase):
             displayed = []
 
             def process():
+                """Open a connection, wait for the other thread, then process `self.entry`.
+
+                Returns:
+                    The number of entries reported as new, which is 0 or 1.
+                """
                 connection = module.connect_database()
                 start.wait(timeout=5)
 
                 def display(entries):
+                    """Append the displayed identifiers to `displayed` under `display_lock`."""
                     with display_lock:
                         displayed.extend(entry.identifier for entry in entries)
 
@@ -305,8 +331,9 @@ class TrendingNewTests(unittest.TestCase):
         self.assertEqual(displayed, [self.entry.identifier])
 
     def test_duplicate_entries_in_one_batch_are_displayed_once(self):
-        with tempfile.TemporaryDirectory() as data_home, patch.dict(
-            os.environ, {"XDG_DATA_HOME": data_home}
+        with (
+            tempfile.TemporaryDirectory() as data_home,
+            patch.dict(os.environ, {"XDG_DATA_HOME": data_home}),
         ):
             database = module.connect_database()
             displayed = []
@@ -337,9 +364,7 @@ class TrendingNewTests(unittest.TestCase):
             shutil.copy2(SCRIPT, relocated_script)
             environment = os.environ.copy()
             environment["PATH"] = (
-                str(Path(sys.executable).parent)
-                + os.pathsep
-                + environment.get("PATH", "")
+                str(Path(sys.executable).parent) + os.pathsep + environment.get("PATH", "")
             )
             environment["PYTHONDONTWRITEBYTECODE"] = "1"
             result = subprocess.run(
@@ -357,13 +382,13 @@ class TrendingNewTests(unittest.TestCase):
 
     def test_no_color_tty_output_has_no_terminal_sequences(self):
         class TtyStringIO(StringIO):
+            """In-memory text stream that reports itself as a terminal."""
+
             def isatty(self):
                 return True
 
         output = TtyStringIO()
-        with patch.object(sys, "stdout", output), patch.dict(
-            os.environ, {"NO_COLOR": "1"}
-        ):
+        with patch.object(sys, "stdout", output), patch.dict(os.environ, {"NO_COLOR": "1"}):
             console = module.make_console()
             console.print(module.repository_table([self.entry], console, show_range=True))
             console.print(module.developer_table([self.entry]))
@@ -392,18 +417,24 @@ class TrendingNewTests(unittest.TestCase):
         malformed_page = module.BeautifulSoup(
             "<main><h2>Unexpected response</h2></main>", "html.parser"
         )
-        with patch.object(module, "fetch_page", return_value=malformed_page):
-            with self.assertRaisesRegex(SystemExit, "page structure may have changed"):
-                module.fetch_repositories("daily", None)
+        with (
+            patch.object(module, "fetch_page", return_value=malformed_page),
+            self.assertRaisesRegex(SystemExit, "page structure may have changed"),
+        ):
+            module.fetch_repositories("daily", None)
 
     def test_launcher_reexecs_when_run_with_the_venv_base_interpreter(self):
         venv_python = SCRIPT.parent / ".venv" / "bin" / "python"
         if not venv_python.exists():
             self.skipTest("no .venv next to the script")
         base_python = venv_python.resolve()
-        if base_python == venv_python or subprocess.run(
-            [str(base_python), "-c", "import requests"], capture_output=True, check=False
-        ).returncode == 0:
+        if (
+            base_python == venv_python
+            or subprocess.run(
+                [str(base_python), "-c", "import requests"], capture_output=True, check=False
+            ).returncode
+            == 0
+        ):
             self.skipTest("the venv's base interpreter is not distinct from the venv")
 
         environment = os.environ.copy()
@@ -422,8 +453,24 @@ class TrendingNewTests(unittest.TestCase):
 
 
 class FetchPageRetryTests(unittest.TestCase):
+    """Tests for the retry and backoff behaviour of `fetch_page`.
+
+    `requests.get` is patched to return or raise a scripted sequence of outcomes, and the `sleep`
+    hook records the requested delays instead of waiting.
+    """
+
     @staticmethod
     def response(status, headers=None, body="<html></html>"):
+        """Build a `requests.Response` for the Trending page without a network request.
+
+        Args:
+            status: HTTP status code to report.
+            headers: Optional response headers, such as `Retry-After`.
+            body: Response body text, stored UTF-8 encoded.
+
+        Returns:
+            A response for `https://github.com/trending` with the given status, headers, and body.
+        """
         response = requests.Response()
         response.status_code = status
         response._content = body.encode()
@@ -432,6 +479,16 @@ class FetchPageRetryTests(unittest.TestCase):
         return response
 
     def fetch(self, responses):
+        """Call `fetch_page` with `requests.get` scripted to produce `responses` in order.
+
+        Args:
+            responses: Responses to return or exceptions to raise, one per request attempt.
+
+        Returns:
+            A tuple `(result, sleeps, get)`: the parsed page, or the `SystemExit` raised when
+            fetching fails; the retry delays passed to `sleep`, in seconds; and the mock that
+            replaced `requests.get`.
+        """
         sleeps = []
         with patch.object(module.requests, "get", side_effect=responses) as get:
             try:
@@ -512,7 +569,14 @@ DEVELOPER_FIXTURE = """
 
 
 class FeatureTests(unittest.TestCase):
+    """Tests for peek, forget, JSON output, history filters, and multi-language fetching.
+
+    Also covers developer popular repos and rejection of incompatible options. `setUp` points
+    `XDG_DATA_HOME` at a fresh temporary directory, so each test starts with no recorded entries.
+    """
+
     def setUp(self):
+        """Point `XDG_DATA_HOME` at a temporary directory that is removed after the test."""
         self.data_home = tempfile.TemporaryDirectory()
         self.addCleanup(self.data_home.cleanup)
         patcher = patch.dict(os.environ, {"XDG_DATA_HOME": self.data_home.name})
@@ -521,6 +585,7 @@ class FeatureTests(unittest.TestCase):
 
     @staticmethod
     def repository(identifier, language="Python", description="A project.", time_range="daily"):
+        """Build a repository entry for `identifier` with 1,000 stars and 100 gained."""
         return module.Entry(
             identifier,
             f"https://github.com/{identifier}",
@@ -532,6 +597,19 @@ class FeatureTests(unittest.TestCase):
         )
 
     def run_main(self, *arguments, fetched=None):
+        """Run the command-line entry point and return what it printed to stdout.
+
+        Args:
+            *arguments: Command-line arguments, without the program name.
+            fetched: Stand-in for `fetch_repositories`, installed as the mock's `side_effect`.
+                When `None`, `fetch_repositories` is not patched.
+
+        Returns:
+            The captured standard output.
+
+        Raises:
+            SystemExit: Propagated unchanged from `main`, after the patches are undone.
+        """
         output = StringIO()
         patches = [
             patch.object(sys, "argv", ["trending-new", *arguments]),
@@ -549,6 +627,12 @@ class FeatureTests(unittest.TestCase):
         return output.getvalue()
 
     def record(self, kind, *entries):
+        """Mark entries as seen in the state database, as an earlier run would have.
+
+        Args:
+            kind: Entry kind, `repository` or `developer`.
+            *entries: Entries to record.
+        """
         database = module.connect_database()
         try:
             with module.immediate_transaction(database):
@@ -557,6 +641,7 @@ class FeatureTests(unittest.TestCase):
             database.close()
 
     def seen_identifiers(self):
+        """Return the set of recorded identifiers across all entry kinds."""
         database = module.connect_database()
         try:
             return {row[0] for row in database.execute("SELECT identifier FROM seen")}
@@ -573,7 +658,9 @@ class FeatureTests(unittest.TestCase):
         self.assertIsNone(entries[1].popular_repo)
 
     def test_developer_table_history_and_picker_show_popular_repo(self):
-        alice = module.Entry("alice", "https://github.com/alice", "alice", popular_repo="alice/fast-tool")
+        alice = module.Entry(
+            "alice", "https://github.com/alice", "alice", popular_repo="alice/fast-tool"
+        )
         bob = module.Entry("bob", "https://github.com/bob", "bob")
         self.record("developer", alice, bob)
         database = module.connect_database()
@@ -581,8 +668,10 @@ class FeatureTests(unittest.TestCase):
             history = module.show_history(database, "developer", 10)
         finally:
             database.close()
-        self.assertEqual({entry.identifier: entry.popular_repo for entry in history},
-                         {"alice": "alice/fast-tool", "bob": None})
+        self.assertEqual(
+            {entry.identifier: entry.popular_repo for entry in history},
+            {"alice": "alice/fast-tool", "bob": None},
+        )
 
         console = module.Console(width=120, no_color=True)
         with console.capture() as capture:
@@ -599,6 +688,7 @@ class FeatureTests(unittest.TestCase):
         results = {"daily": [shared], "weekly": [shared, self.repository("owner/weekly")]}
 
         def fetched(time_range, language, spoken_language=None):
+            """Return a fresh list of the canned entries for `time_range`, if any."""
             return list(results.get(time_range, []))
 
         first = self.run_main("--peek", "--json", fetched=fetched)
@@ -637,15 +727,18 @@ class FeatureTests(unittest.TestCase):
         self.assertIn("Forgot 1", output)
         self.assertEqual(self.seen_identifiers(), {"alice/project"})
 
-        with patch.object(sys, "argv", ["trending-new", "forget"]), self.assertRaisesRegex(
-            SystemExit, "at least one identifier"
+        with (
+            patch.object(sys, "argv", ["trending-new", "forget"]),
+            self.assertRaisesRegex(SystemExit, "at least one identifier"),
         ):
             module.main()
 
     def test_json_output_for_fetch_and_history(self):
         repository = self.repository("owner/project", language=None, description="")
         output = self.run_main(
-            "daily", "--json", fetched=lambda time_range, language, spoken_language=None: [repository]
+            "daily",
+            "--json",
+            fetched=lambda time_range, language, spoken_language=None: [repository],
         )
         [record] = json.loads(output)
         self.assertEqual(record["kind"], "repository")
@@ -655,11 +748,15 @@ class FeatureTests(unittest.TestCase):
         self.assertIsNone(record["popular_repo"])
         self.assertEqual(record["gained_stars"], 100)
 
-        self.assertEqual([item["identifier"] for item in json.loads(self.run_main("history", "--json"))],
-                         ["owner/project"])
+        self.assertEqual(
+            [item["identifier"] for item in json.loads(self.run_main("history", "--json"))],
+            ["owner/project"],
+        )
         self.assertEqual(
             self.run_main(
-                "daily", "--json", fetched=lambda time_range, language, spoken_language=None: [repository]
+                "daily",
+                "--json",
+                fetched=lambda time_range, language, spoken_language=None: [repository],
             ).strip(),
             "[]",
         )
@@ -676,13 +773,16 @@ class FeatureTests(unittest.TestCase):
                         ("d/rust", "Rust", "Unrelated"),
                     ]
                 ):
-                    module.record_seen(database, "repository", [self.repository(identifier, language, description)])
+                    module.record_seen(
+                        database, "repository", [self.repository(identifier, language, description)]
+                    )
                     database.execute(
                         "UPDATE seen SET first_seen_at = ? WHERE identifier = ?",
                         (f"2024-01-0{index + 1}", identifier),
                     )
 
             def identifiers(**filters):
+                """Return history identifiers for the given filters, limited to one entry."""
                 return [
                     entry.identifier
                     for entry in module.show_history(database, "repository", 1, **filters)
@@ -701,11 +801,18 @@ class FeatureTests(unittest.TestCase):
         calls = []
 
         def fetched(time_range, language, spoken_language=None):
+            """Record the call and return one repository named after `language`."""
             calls.append((time_range, language, spoken_language))
             return [self.repository(f"owner/{language}")]
 
         output = self.run_main(
-            "daily", "--language", "python", "--language", "rust", "--spoken-language", "en",
+            "daily",
+            "--language",
+            "python",
+            "--language",
+            "rust",
+            "--spoken-language",
+            "en",
             fetched=fetched,
         )
 
@@ -715,8 +822,9 @@ class FeatureTests(unittest.TestCase):
 
     def test_spoken_language_is_sent_as_a_query_parameter(self):
         empty_page = module.BeautifulSoup("", "html.parser")
-        with patch.object(module, "fetch_page", return_value=empty_page) as fetch, self.assertRaises(
-            SystemExit
+        with (
+            patch.object(module, "fetch_page", return_value=empty_page) as fetch,
+            self.assertRaises(SystemExit),
         ):
             module.fetch_repositories("daily", None, spoken_language="zh")
         self.assertEqual(fetch.call_args.args[1], {"since": "daily", "spoken_language_code": "zh"})
@@ -724,21 +832,45 @@ class FeatureTests(unittest.TestCase):
     def test_incompatible_options_are_rejected(self):
         cases = (
             (["--json", "--open"], "--json cannot be combined with --open"),
-            (["--spoken-language", "en", "--developers"], "--spoken-language cannot be used with --developers"),
+            (
+                ["--spoken-language", "en", "--developers"],
+                "--spoken-language cannot be used with --developers",
+            ),
             (["daily", "--search", "x"], "--search can only be used with history"),
             (["history", "--peek"], "--peek cannot be used with history"),
             (["daily", "owner/repo"], "only accepted by the forget command"),
         )
         for arguments, message in cases:
-            with self.subTest(arguments=arguments), patch.object(
-                sys, "argv", ["trending-new", *arguments]
-            ), self.assertRaisesRegex(SystemExit, message):
+            with (
+                self.subTest(arguments=arguments),
+                patch.object(sys, "argv", ["trending-new", *arguments]),
+                self.assertRaisesRegex(SystemExit, message),
+            ):
                 module.main()
 
 
-@unittest.skipUnless(os.environ.get("TRENDING_NEW_LIVE") == "1", "set TRENDING_NEW_LIVE=1 to hit GitHub")
+@unittest.skipUnless(
+    os.environ.get("TRENDING_NEW_LIVE") == "1", "set TRENDING_NEW_LIVE=1 to hit GitHub"
+)
 class LiveSmokeTests(unittest.TestCase):
+    """Smoke tests that check the page parsers against the live github.com/trending pages.
+
+    They need network access and run only when `TRENDING_NEW_LIVE=1` is set. Each run uses
+    `--peek` and a temporary `XDG_DATA_HOME`, so no state is recorded.
+    """
+
     def run_json(self, *arguments):
+        """Run the script against GitHub with `--json --peek` and return the parsed records.
+
+        The script runs in a subprocess with a temporary `XDG_DATA_HOME`. The calling test fails
+        unless the script exits successfully and prints at least one record.
+
+        Args:
+            *arguments: Command-line arguments placed before `--json --peek`.
+
+        Returns:
+            The decoded list of JSON records.
+        """
         with tempfile.TemporaryDirectory() as data_home:
             environment = os.environ.copy()
             environment["XDG_DATA_HOME"] = data_home

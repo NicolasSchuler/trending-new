@@ -69,3 +69,11 @@ trending-new --help
 # Also hit github.com/trending to check the page parsers still match (needs network)
 TRENDING_NEW_LIVE=1 .venv/bin/python -m unittest -v
 ```
+
+## Code style
+
+Docstrings follow the [Google Python Style Guide](https://google.github.io/styleguide/pyguide.html#38-comments-and-docstrings) and are enforced by ruff's pydocstyle rules (configured in `pyproject.toml`). Check with:
+
+```bash
+ruff check trending-new test_trending_new.py
+```

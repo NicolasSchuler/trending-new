@@ -13,24 +13,27 @@ import subprocess
 import sys
 import time
 import webbrowser
+from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Callable, Iterable, Iterator
 from urllib.parse import quote
 
 
 def _bootstrap_into_venv() -> None:
-    """Re-exec with the bundled ``.venv`` interpreter when deps are missing.
+    """Re-run the script with the bundled `.venv` interpreter when dependencies are missing.
 
-    The executable is typically invoked through a symlink on ``PATH`` (e.g.
-    ``~/.local/bin/trending-new``) whose ``#!/usr/bin/env python3`` shebang can
-    resolve to a system Python without this project's dependencies. When that
-    happens, re-run the real script with the virtualenv's Python so the tool
-    works regardless of how it was launched.
+    The executable is typically invoked through a symlink on `PATH` (e.g.
+    `~/.local/bin/trending-new`) whose `#!/usr/bin/env python3` shebang can resolve to a
+    system Python without this project's dependencies. When that happens, re-run the real
+    script with the virtualenv's Python so the tool works regardless of how it was launched.
+
+    Only `requests` is probed. The function returns without doing anything when it is
+    importable, when the resolved script has no `.venv/bin/python` beside it, or when the
+    current interpreter already runs from that virtualenv, which prevents an endless re-exec
+    loop. Otherwise `os.execv` replaces the current process and the call never returns.
     """
-
     import importlib.util
 
     if importlib.util.find_spec("requests") is not None:
@@ -70,6 +73,26 @@ RANGE_SHORT_LABELS = {"daily": "day", "weekly": "wk", "monthly": "mo"}
 
 @dataclass(frozen=True)
 class Entry:
+    """A repository or developer from GitHub Trending or from the local history.
+
+    Entries loaded from history carry the values stored when they were recorded.
+
+    Attributes:
+        identifier: `owner/repo` for repositories, or the login for developers.
+        url: The GitHub page of the repository or developer.
+        description: The repository description, or for developers the text of the row's
+            first paragraph. Empty when the page shows none.
+        language: The repository language as GitHub displays it, or None when absent.
+            Always None for developers.
+        stars: Total repository stars at fetch time, or None when absent or unparseable.
+        gained_stars: Stars gained during `trending_range`, or None when absent or
+            unparseable.
+        trending_range: The range ("daily", "weekly", or "monthly") the repository was
+            fetched for. Always None for developers.
+        popular_repo: The developer's "Popular repo" as `owner/repo`, or None when GitHub
+            omits it. Always None for repositories.
+    """
+
     identifier: str
     url: str
     description: str
@@ -81,6 +104,15 @@ class Entry:
 
 
 def state_path() -> Path:
+    """Return the location of the SQLite state file.
+
+    The file lives at `$XDG_DATA_HOME/trending-new/state.sqlite3`. When `XDG_DATA_HOME` is
+    unset, empty, or not an absolute path, `~/.local/share` is used in its place. Nothing is
+    created on disk.
+
+    Returns:
+        The path of the state database.
+    """
     configured_home = os.environ.get("XDG_DATA_HOME")
     data_home = Path(configured_home) if configured_home else None
     if data_home is None or not data_home.is_absolute():
@@ -90,6 +122,19 @@ def state_path() -> Path:
 
 @contextmanager
 def immediate_transaction(database: sqlite3.Connection) -> Iterator[None]:
+    """Run the enclosed block inside a write-locking SQLite transaction.
+
+    `BEGIN IMMEDIATE` acquires the write lock at the start, so another connection cannot
+    begin writing until this transaction ends. The transaction commits when the block
+    finishes normally. Any exception, including `KeyboardInterrupt` and `SystemExit`, rolls
+    it back and is re-raised.
+
+    Args:
+        database: An open connection with no transaction in progress.
+
+    Yields:
+        None; the `with` block runs inside the transaction.
+    """
     database.execute("BEGIN IMMEDIATE")
     try:
         yield
@@ -101,6 +146,17 @@ def immediate_transaction(database: sqlite3.Connection) -> Iterator[None]:
 
 
 def connect_database() -> sqlite3.Connection:
+    """Open the state database, creating or upgrading its `seen` table as needed.
+
+    Missing parent directories and the database file are created. The `seen` table, keyed
+    by entry kind and identifier, is created if absent, and any of the later-added columns
+    `language`, `stars`, `gained_stars`, `trending_range`, and `popular_repo` that it lacks
+    are added, so older databases are upgraded in place. Setup runs in one immediate
+    transaction; if it fails, the connection is closed before the exception propagates.
+
+    Returns:
+        An open connection that the caller must close.
+    """
     path = state_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     database = sqlite3.connect(path)
@@ -122,9 +178,7 @@ def connect_database() -> sqlite3.Connection:
                 )
             """)
 
-            existing_columns = {
-                row[1] for row in database.execute("PRAGMA table_info(seen)")
-            }
+            existing_columns = {row[1] for row in database.execute("PRAGMA table_info(seen)")}
             for column, column_type in (
                 ("language", "TEXT"),
                 ("stars", "INTEGER"),
@@ -141,6 +195,15 @@ def connect_database() -> sqlite3.Connection:
 
 
 def make_console() -> Console:
+    """Create the Rich console used for table output.
+
+    Output is plain text, without colour, styling, or hyperlinks, when stdout is not a
+    terminal or `NO_COLOR` is present in the environment (even if empty). Automatic
+    highlighting is always disabled.
+
+    Returns:
+        The configured console.
+    """
     plain_output = not sys.stdout.isatty() or "NO_COLOR" in os.environ
     return Console(
         no_color=plain_output,
@@ -151,6 +214,19 @@ def make_console() -> Console:
 
 
 def retry_delay(attempt: int, response: requests.Response | None) -> float:
+    """Return how long to wait before retrying a failed request.
+
+    The delay starts at `RETRY_BACKOFF_SECONDS` and doubles with each attempt. A
+    `Retry-After` header holding a whole number of seconds replaces it; the HTTP-date form
+    is ignored. The result is capped at `MAX_RETRY_DELAY_SECONDS`.
+
+    Args:
+        attempt: The 1-based number of the attempt that just failed.
+        response: The failed response, or None when no response was received.
+
+    Returns:
+        The delay in seconds.
+    """
     delay = RETRY_BACKOFF_SECONDS * 2 ** (attempt - 1)
     retry_after = response.headers.get("Retry-After", "").strip() if response is not None else ""
     if retry_after.isdigit():
@@ -161,6 +237,24 @@ def retry_delay(attempt: int, response: requests.Response | None) -> float:
 def fetch_page(
     url: str, params: dict[str, str], *, sleep: Callable[[float], None] = time.sleep
 ) -> BeautifulSoup:
+    """Fetch and parse an HTML page, retrying transient failures.
+
+    Each request sends the tool's User-Agent and uses a `DEFAULT_TIMEOUT_SECONDS` timeout.
+    Up to `FETCH_ATTEMPTS` attempts are made: connection errors, timeouts, HTTP 429, and
+    HTTP 5xx responses are retried after the delay from `retry_delay`, with a note on
+    stderr, while any other request error fails immediately.
+
+    Args:
+        url: The page URL.
+        params: Query-string parameters.
+        sleep: Called with the delay in seconds between attempts; replaceable in tests.
+
+    Returns:
+        The parsed document.
+
+    Raises:
+        SystemExit: If a request fails with a non-transient error or the last attempt fails.
+    """
     for attempt in range(1, FETCH_ATTEMPTS + 1):
         try:
             response = requests.get(
@@ -193,10 +287,12 @@ def fetch_page(
 
 
 def clean_text(node: object | None) -> str:
+    """Return a node's stripped text fragments joined by spaces; empty for a missing node."""
     return node.get_text(" ", strip=True) if node else ""
 
 
 def parse_count(text: str) -> int | None:
+    """Return the first number in `text` with commas removed, or None if it contains no digits."""
     match = re.search(r"\d[\d,]*", text)
     return int(match.group().replace(",", "")) if match else None
 
@@ -204,6 +300,25 @@ def parse_count(text: str) -> int | None:
 def fetch_repositories(
     time_range: str, language: str | None, spoken_language: str | None = None
 ) -> list[Entry]:
+    """Fetch and parse the GitHub Trending repositories page.
+
+    Rows without a link to a plain `owner/repo` path are skipped.
+
+    Args:
+        time_range: The trending range, one of `RANGES`; sent as the `since` parameter.
+        language: A language path segment such as "python", percent-encoded into the URL,
+            or None for all languages.
+        spoken_language: A spoken-language code for repository descriptions such as "en",
+            or None for any.
+
+    Returns:
+        The repositories in page order, each tagged with `time_range`. Empty when GitHub
+        reports that nothing is trending for the chosen filters.
+
+    Raises:
+        SystemExit: If the page cannot be fetched, or if it lists no repositories without
+            saying that nothing is trending, which suggests its structure has changed.
+    """
     url = "https://github.com/trending"
     if language:
         url += "/" + quote(language, safe="")
@@ -245,6 +360,21 @@ def fetch_repositories(
 
 
 def fetch_developers(time_range: str) -> list[Entry]:
+    """Fetch and parse the GitHub Trending developers page.
+
+    Rows without a link to a single-segment profile path are skipped. Each entry's
+    description is the text of the row's first paragraph, and `popular_repo` is set only
+    when the row links to a plain `owner/repo` path. `trending_range` is left as None.
+
+    Args:
+        time_range: The trending range, one of `RANGES`; sent as the `since` parameter.
+
+    Returns:
+        The developers in page order.
+
+    Raises:
+        SystemExit: If the page cannot be fetched or yields no developers.
+    """
     document = fetch_page("https://github.com/trending/developers", {"since": time_range})
 
     entries: list[Entry] = []
@@ -271,7 +401,21 @@ def fetch_developers(time_range: str) -> list[Entry]:
     return entries
 
 
-def unseen_entries(database: sqlite3.Connection, kind: str, entries: Iterable[Entry]) -> list[Entry]:
+def unseen_entries(
+    database: sqlite3.Connection, kind: str, entries: Iterable[Entry]
+) -> list[Entry]:
+    """Return the entries not yet recorded as seen, without changing the database.
+
+    Only the first occurrence of each identifier is considered, and input order is kept.
+
+    Args:
+        database: The state database.
+        kind: The entry kind, "repository" or "developer".
+        entries: Candidate entries.
+
+    Returns:
+        The entries whose identifier has no `seen` row for `kind`.
+    """
     unseen: list[Entry] = []
     checked_identifiers: set[str] = set()
     for entry in entries:
@@ -287,7 +431,18 @@ def unseen_entries(database: sqlite3.Connection, kind: str, entries: Iterable[En
 
 
 def record_seen(database: sqlite3.Connection, kind: str, entries: Iterable[Entry]) -> None:
-    timestamp = datetime.now(timezone.utc).isoformat()
+    """Insert or update `seen` rows for the entries, stamped with the current UTC time.
+
+    New rows get identical `first_seen_at` and `last_seen_at` timestamps. Existing rows keep
+    `first_seen_at`; `last_seen_at` and every stored entry field are overwritten. The caller
+    is responsible for committing.
+
+    Args:
+        database: The state database.
+        kind: The entry kind, "repository" or "developer".
+        entries: The entries to record.
+    """
+    timestamp = datetime.now(UTC).isoformat()
     database.executemany(
         """
         INSERT INTO seen(
@@ -331,6 +486,22 @@ def process_unseen_entries(
     *,
     record: bool = True,
 ) -> list[Entry]:
+    """Display the entries not seen before and, unless peeking, record them as seen.
+
+    When `record` is true, the lookup, display, and recording share one immediate
+    transaction, so another run cannot record the same entries in between, and nothing is
+    recorded if `display` raises. Otherwise the database is only read.
+
+    Args:
+        database: The state database.
+        kind: The entry kind, "repository" or "developer".
+        entries: Freshly fetched entries.
+        display: Called once with the unseen entries, only when there are any.
+        record: Whether to record the unseen entries as seen.
+
+    Returns:
+        The unseen entries, possibly empty.
+    """
     if not record:
         new_entries = unseen_entries(database, kind, entries)
         if new_entries:
@@ -346,6 +517,15 @@ def process_unseen_entries(
 
 
 def format_count(value: int | None) -> str:
+    """Format a count compactly, e.g. 950, 1.5k, 2k, or 3.1m.
+
+    Args:
+        value: The count, or None when unknown.
+
+    Returns:
+        An em dash for None; the plain number below 1,000; otherwise the value rounded to
+        one decimal, with a trailing ".0" dropped and a k, m, or b suffix.
+    """
     if value is None:
         return "—"
     if value < 1_000:
@@ -358,13 +538,35 @@ def format_count(value: int | None) -> str:
 
 
 def trend_label(entry: Entry, *, show_range: bool) -> str:
+    """Return the star gain as shown in tables and the picker, e.g. "+1.2k" or "+1.2k / wk".
+
+    Args:
+        entry: The entry whose gain to label.
+        show_range: Whether to append the entry's trending range as day, wk, or mo.
+
+    Returns:
+        The compact gain with a plus sign, or an em dash when the gain is unknown. The range
+        is appended only when requested and the entry has a known range.
+    """
     if entry.gained_stars is None:
         return "—"
     suffix = RANGE_SHORT_LABELS.get(entry.trending_range or "", "")
-    return f"+{format_count(entry.gained_stars)}" + (f" / {suffix}" if show_range and suffix else "")
+    return f"+{format_count(entry.gained_stars)}" + (
+        f" / {suffix}" if show_range and suffix else ""
+    )
 
 
 def repository_cell(entry: Entry, include_description: bool) -> Text:
+    """Build a repository cell with the hyperlinked identifier and an optional description.
+
+    Args:
+        entry: The repository entry.
+        include_description: Whether to add a non-empty description, dimmed, on a second
+            line.
+
+    Returns:
+        The styled cell text.
+    """
     cell = Text()
     cell.append(entry.identifier, style=f"bold cyan link {entry.url}")
     if include_description and entry.description:
@@ -374,6 +576,7 @@ def repository_cell(entry: Entry, include_description: bool) -> Text:
 
 
 def new_table() -> Table:
+    """Create an empty Rich table with the styling shared by all result tables."""
     return Table(
         box=box.SIMPLE_HEAVY,
         border_style="dim",
@@ -387,6 +590,23 @@ def new_table() -> Table:
 def repository_table(
     entries: list[Entry], console: Console, *, show_range: bool, start_index: int = 1
 ) -> Table:
+    """Build the repository table, choosing a layout that fits the console width.
+
+    At 110 columns or more, descriptions get their own column. Below that they move beneath
+    the repository name, and below 80 columns the language, stars, and gain are also merged
+    into a single SIGNAL column. The stars and trend headers get emoji only when the console
+    is a terminal with colour enabled.
+
+    Args:
+        entries: Repository entries in display order.
+        console: The console the table is printed to.
+        show_range: Whether gains include their trending range. This also renames the gain
+            column from GAIN to TREND, or to TREND WHEN FOUND in the widest layout.
+        start_index: The number of the first row, so numbering can continue across tables.
+
+    Returns:
+        The populated table.
+    """
     width = console.width
     table = new_table()
     use_emoji = console.is_terminal and not console.no_color
@@ -399,7 +619,9 @@ def repository_table(
 
     if width >= 110:
         table.add_column("#", justify="right", width=3)
-        table.add_column("REPOSITORY", min_width=22, max_width=34, no_wrap=True, overflow="ellipsis")
+        table.add_column(
+            "REPOSITORY", min_width=22, max_width=34, no_wrap=True, overflow="ellipsis"
+        )
         table.add_column("LANGUAGE", min_width=9, max_width=13, no_wrap=True, overflow="ellipsis")
         table.add_column(stars_header, justify="right", width=8)
         table.add_column(trend_header, justify="right", min_width=9, max_width=19)
@@ -441,6 +663,18 @@ def repository_table(
 
 
 def developer_table(entries: list[Entry], *, start_index: int = 1) -> Table:
+    """Build the developer table with hyperlinked logins and popular repositories.
+
+    The PROFILE NAME column shows each entry's description. Missing values appear as an em
+    dash.
+
+    Args:
+        entries: Developer entries in display order.
+        start_index: The number of the first row, so numbering can continue across tables.
+
+    Returns:
+        The populated table.
+    """
     table = new_table()
     table.add_column("#", justify="right", width=3)
     table.add_column("DEVELOPER", min_width=20)
@@ -473,11 +707,26 @@ def print_entries(
     start_index: int = 1,
     spoken_language: str | None = None,
 ) -> None:
+    """Print a title, a summary line, and the table for one batch of entries.
+
+    Args:
+        entries: The entries to print.
+        console: The console to print to.
+        kind: The entry kind, "repository" or "developer".
+        time_range: The range the entries were fetched for, one of `RANGES`. Ignored, and
+            may be None, when `history` is true.
+        language: The language filter of the fetch, or None for all languages. Used only in
+            titles of fetched repositories.
+        history: Whether the entries come from local history rather than a fetch.
+        show_range: Whether repository gains include their trending range.
+        start_index: The number of the first row, so numbering can continue across tables.
+        spoken_language: A spoken-language code to mention in titles of fetched
+            repositories, if any.
+    """
     if history:
         title = f"Previously shown GitHub Trending {'developers' if kind == 'developer' else 'repositories'}"
         subtitle = (
-            f"{len(entries)} recorded locally · stars and gains as first shown"
-            " · --open to revisit"
+            f"{len(entries)} recorded locally · stars and gains as first shown · --open to revisit"
         )
     elif kind == "repository":
         source_language = language or "all languages"
@@ -499,6 +748,22 @@ def print_entries(
 
 
 def picker_label(entry: Entry, index: int, *, show_range: bool, kind: str = "repository") -> str:
+    """Format one aligned, single-line picker row for an entry.
+
+    Developer rows show the login, popular repository, and description. Repository rows show
+    the identifier, language, stars, gain, and description, or only the identifier and
+    description when language, stars, and gain are all unknown. Leading columns are padded
+    and truncated to fixed widths.
+
+    Args:
+        entry: The entry to describe.
+        index: The row number shown first.
+        show_range: Whether the gain includes its trending range.
+        kind: The entry kind, "repository" or "developer".
+
+    Returns:
+        The label text.
+    """
     if kind == "developer":
         return (
             f"{index:>2}  {entry.identifier:<24.24}  {(entry.popular_repo or '—'):<40.40}  "
@@ -515,6 +780,25 @@ def picker_label(entry: Entry, index: int, *, show_range: bool, kind: str = "rep
 def select_entries(
     entries: list[Entry], *, show_range: bool, kind: str = "repository"
 ) -> list[Entry]:
+    """Let the user pick entries interactively.
+
+    Uses a multi-select `fzf` picker when `fzf` is installed. Otherwise prompts for
+    comma-separated row numbers, where "a" selects everything and an empty answer cancels;
+    numbers outside the list are ignored.
+
+    Args:
+        entries: The entries to choose from, numbered from 1.
+        show_range: Whether picker gains include their trending range.
+        kind: The entry kind, "repository" or "developer".
+
+    Returns:
+        The chosen entries in their original order; empty when nothing was chosen.
+
+    Raises:
+        SystemExit: If stdin is not a terminal, if `fzf` exits with a status other than 0
+            or 1 (including 130 when cancelled with Esc or Ctrl-C), or if the typed answer
+            is not a comma-separated list of integers.
+    """
     if not sys.stdin.isatty():
         raise SystemExit("--open needs an interactive terminal.")
 
@@ -554,16 +838,22 @@ def select_entries(
 
 
 def open_entries(entries: list[Entry]) -> None:
+    """Open each entry's page in a new browser tab, printing its URL to stdout first."""
     for entry in entries:
         print(f"Opening {entry.url}")
         webbrowser.open_new_tab(entry.url)
 
 
 def normalize_language(value: str | None) -> str | None:
+    """Return `value` case-folded with spaces replaced by hyphens, or None if it is empty."""
     return value.casefold().replace(" ", "-") if value else None
 
 
 def contains_text(haystack: str | None, needle: str) -> bool:
+    """Return whether `needle` occurs in `haystack`, ignoring case.
+
+    `needle` must already be case-folded; a None `haystack` counts as empty.
+    """
     return needle in (haystack or "").casefold()
 
 
@@ -574,6 +864,24 @@ def show_history(
     languages: list[str] | None = None,
     search: str | None = None,
 ) -> list[Entry]:
+    """Return recorded entries of one kind, ordered by when they were first shown, newest first.
+
+    Only queries the database; the caller prints the result. Filters apply before the
+    limit. Registers the `normalize_language` and `contains_text` SQL functions on
+    `database`.
+
+    Args:
+        database: The state database.
+        kind: The entry kind, "repository" or "developer".
+        limit: The maximum number of entries to return.
+        languages: Keep entries whose language matches any of these, ignoring case and
+            treating spaces as hyphens. None or empty disables this filter.
+        search: Keep entries whose identifier or description contains this text, ignoring
+            case. None or empty disables this filter.
+
+    Returns:
+        The matching entries with their stored values.
+    """
     database.create_function("normalize_language", 1, normalize_language, deterministic=True)
     database.create_function("contains_text", 2, contains_text, deterministic=True)
 
@@ -600,6 +908,21 @@ def show_history(
 
 
 def forget_entries(database: sqlite3.Connection, kind: str, identifiers: list[str]) -> None:
+    """Delete entries from the seen history so they are shown again on the next run.
+
+    Identifiers are stripped of surrounding whitespace and slashes and exact duplicates are
+    dropped; matching against the history ignores case. All deletions share one
+    transaction. Removed identifiers are reported on stdout and unknown ones on stderr.
+
+    Args:
+        database: The state database.
+        kind: The entry kind, "repository" or "developer".
+        identifiers: `owner/repo` names or developer logins to forget.
+
+    Raises:
+        SystemExit: With status 1 if any identifier was not found. The deletions of the
+            identifiers that were found are committed first.
+    """
     removed: list[str] = []
     missing: list[str] = []
     with immediate_transaction(database):
@@ -619,6 +942,15 @@ def forget_entries(database: sqlite3.Connection, kind: str, identifiers: list[st
 
 
 def print_json(entries: list[Entry], kind: str) -> None:
+    """Print entries to stdout as an indented JSON array.
+
+    Each object holds `kind` and every `Entry` field; an empty description becomes null.
+    Non-ASCII characters are written as-is.
+
+    Args:
+        entries: The entries to print; an empty list prints `[]`.
+        kind: The entry kind stored in each object.
+    """
     records = [
         {"kind": kind, **asdict(entry), "description": entry.description or None}
         for entry in entries
@@ -627,6 +959,16 @@ def print_json(entries: list[Entry], kind: str) -> None:
 
 
 def parse_arguments() -> argparse.Namespace:
+    """Parse the command line.
+
+    Options and positional arguments may be intermixed, as in `forget --developers alice`.
+    On invalid input, argparse prints the usage and exits with status 2.
+
+    Returns:
+        The parsed arguments: `command`, `identifiers`, `language` (a list, or None when not
+        given), `spoken_language`, `developers`, `open`, `peek`, `json`, `search`, and
+        `limit`.
+    """
     parser = argparse.ArgumentParser(
         description="Show GitHub Trending repositories or developers not displayed before."
     )
@@ -653,18 +995,34 @@ def parse_arguments() -> argparse.Namespace:
         metavar="CODE",
         help="spoken language of repository descriptions, e.g. en or zh",
     )
-    parser.add_argument("--developers", action="store_true", help="track Trending Developers instead")
+    parser.add_argument(
+        "--developers", action="store_true", help="track Trending Developers instead"
+    )
     parser.add_argument("--open", action="store_true", help="interactively select entries to open")
     parser.add_argument(
         "--peek", action="store_true", help="show unseen entries without recording them as seen"
     )
     parser.add_argument("--json", action="store_true", help="print a JSON array instead of a table")
     parser.add_argument("--search", help="history only: text in the identifier or description")
-    parser.add_argument("--limit", type=int, default=50, help="maximum history entries (default: 50)")
+    parser.add_argument(
+        "--limit", type=int, default=50, help="maximum history entries (default: 50)"
+    )
     return parser.parse_intermixed_args()
 
 
 def validate_arguments(arguments: argparse.Namespace) -> None:
+    """Reject option combinations that argparse cannot express.
+
+    Checks that `--limit` is positive, that identifiers are given to `forget` and to no
+    other command, and that options are not combined with commands or other options they do
+    not apply to, such as `--json` with `--open` or `--language` with `--developers`.
+
+    Args:
+        arguments: The parsed command-line arguments.
+
+    Raises:
+        SystemExit: With a message describing the first rule that is violated.
+    """
     command = arguments.command
     if arguments.limit < 1:
         raise SystemExit("--limit must be positive.")
@@ -700,6 +1058,15 @@ def validate_arguments(arguments: argparse.Namespace) -> None:
 
 
 def main() -> None:
+    """Run the command-line tool.
+
+    `forget` removes entries from the history, and `history` lists recorded entries.
+    Otherwise each requested range ("all" means daily, weekly, then monthly) is fetched once
+    per `--language` value. Entries neither seen before nor already shown earlier in the run
+    are printed batch by batch and recorded as seen unless `--peek` is given. `--json`
+    replaces the tables with one JSON array but still records entries. `--open` then lets
+    the user pick entries to open in the browser. The state database is always closed.
+    """
     arguments = parse_arguments()
     validate_arguments(arguments)
 
@@ -757,7 +1124,9 @@ def main() -> None:
                     ]
 
                     def display(
-                        new_entries: list[Entry], time_range: str = time_range, language: str | None = language
+                        new_entries: list[Entry],
+                        time_range: str = time_range,
+                        language: str | None = language,
                     ) -> None:
                         if arguments.json:
                             return

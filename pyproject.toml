@@ -1,0 +1,17 @@
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+include = ["*.py", "trending-new"]
+
+[tool.ruff.lint]
+# Enforce docstring presence and formatting (pydocstyle rules) in the Google
+# convention, on top of ruff's default rule set.
+extend-select = ["D"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.per-file-ignores]
+# Individual test methods are documented by their names; only helpers,
+# fixtures, classes, and the module itself need docstrings.
+"test_trending_new.py" = ["D102", "D103"]
