@@ -13,8 +13,8 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-python@v6
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - run: pip install -r requirements.txt
@@ -30,11 +30,11 @@ jobs:
           - { runner: ubuntu-22.04, target: linux-x86_64 }
           - { runner: ubuntu-22.04-arm, target: linux-arm64 }
           - { runner: macos-15-intel, target: macos-x86_64 }
-          - { runner: macos-14, target: macos-arm64 }
+          - { runner: macos-15, target: macos-arm64 }
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-python@v6
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - name: Install dependencies
@@ -51,7 +51,7 @@ jobs:
           archive="trending-new-${{ matrix.target }}.tar.gz"
           tar -czf "$archive" -C dist trending-new
           echo "ARCHIVE=$archive" >> "$GITHUB_ENV"
-      - uses: actions/upload-artifact@v5
+      - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.target }}
           path: ${{ env.ARCHIVE }}
@@ -63,7 +63,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v5
+      - uses: actions/download-artifact@v8
         with:
           path: artifacts
           merge-multiple: true
