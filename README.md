@@ -51,6 +51,23 @@ Interactive repository tables use ⭐ for total stars and 🔥 for the current t
 
 ## Install
 
+### Prebuilt binary
+
+Each [release](https://github.com/NicolasSchuler/trending-new/releases) ships standalone executables that need no Python: `linux-x86_64`, `linux-arm64`, `macos-x86_64`, and `macos-arm64` (Apple Silicon). Pick the archive for your machine:
+
+```bash
+target=macos-arm64   # or macos-x86_64, linux-x86_64, linux-arm64
+curl -fsSL "https://github.com/NicolasSchuler/trending-new/releases/latest/download/trending-new-$target.tar.gz" \
+  | tar -xz -C ~/.local/bin trending-new
+trending-new --help
+```
+
+The macOS binaries are not signed. Downloading with `curl` as above avoids Gatekeeper; if you downloaded the archive in a browser instead, clear the quarantine flag with `xattr -d com.apple.quarantine ~/.local/bin/trending-new`. Each release also includes a `SHA256SUMS` file. The first start takes a moment while the bundled interpreter unpacks.
+
+To publish a new release, push a version tag (`git tag v0.2.0 && git push origin v0.2.0`); `.github/workflows/release.yml` runs the tests, builds all four executables, and attaches them to the release.
+
+### From source
+
 Dependencies live in `.venv`, created with `uv`. The script re-runs itself with that interpreter, so it works from any `PATH` entry:
 
 ```bash
